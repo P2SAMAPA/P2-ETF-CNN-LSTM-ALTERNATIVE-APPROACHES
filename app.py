@@ -10,9 +10,11 @@ import pandas as pd
 import numpy as np
 
 # ── Module imports ────────────────────────────────────────────────────────────
-from data.loader      import load_dataset, check_data_freshness, get_features_and_targets, dataset_summary
+from data.loader      import (load_dataset, check_data_freshness,
+                               get_features_and_targets, dataset_summary)
 from utils.calendar   import get_est_time, is_sync_window, get_next_signal_date
-from models.base      import build_sequences, train_val_test_split, scale_features, returns_to_labels
+from models.base      import (build_sequences, train_val_test_split,
+                               scale_features, returns_to_labels)
 from models.approach1_wavelet    import train_approach1, predict_approach1
 from models.approach2_regime     import train_approach2, predict_approach2
 from models.approach3_multiscale import train_approach3, predict_approach3
@@ -47,10 +49,10 @@ with st.sidebar:
 
     st.divider()
 
-    start_yr = st.slider("📅 Start Year", 2010, 2024, 2016)
-    fee_bps  = st.slider("💰 Fee (bps)", 0, 50, 10)
-    lookback = st.slider("📐 Lookback (days)", 20, 60, 30, step=5)
-    epochs   = st.number_input("🔁 Max Epochs", 20, 300, 100, step=10)
+    start_yr     = st.slider("📅 Start Year", 2010, 2024, 2016)
+    fee_bps      = st.slider("💰 Fee (bps)", 0, 50, 10)
+    lookback     = st.slider("📐 Lookback (days)", 20, 60, 30, step=5)
+    epochs       = st.number_input("🔁 Max Epochs", 20, 300, 100, step=10)
 
     st.divider()
 
@@ -58,8 +60,10 @@ with st.sidebar:
     split_map    = {"70/15/15": (0.70, 0.15), "80/10/10": (0.80, 0.10)}
     train_pct, val_pct = split_map[split_option]
 
-    include_cash = st.checkbox("💵 Include CASH class", value=True,
-                               help="Model can select CASH (earns T-bill rate) as an alternative to any ETF")
+    include_cash = st.checkbox(
+        "💵 Include CASH class", value=True,
+        help="Model can select CASH (earns T-bill rate) instead of any ETF",
+    )
 
     st.divider()
 
@@ -70,90 +74,102 @@ st.title("🧠 P2-ETF-CNN-LSTM")
 st.caption("Approach 1: Wavelet  ·  Approach 2: Regime-Conditioned  ·  Approach 3: Multi-Scale Parallel")
 st.caption("Winner selected by highest raw annualised return on out-of-sample test set.")
 
-# ── Load data (always, to check freshness) ────────────────────────────────────
+# ── Token check ───────────────────────────────────────────────────────────────
 if not HF_TOKEN:
-    st.error("❌ HF_TOKEN secret not found. Please add it to your HF Space / GitHub secrets.")
+    st.error("❌ HF_TOKEN secret not found. Add it to HF Space / GitHub secrets.")
     st.stop()
 
+# ── Load dataset ──────────────────────────────────────────────────────────────
 with st.spinner("📡 Loading dataset from HuggingFace..."):
-    df = load_dataset(HF_TOKEN)
+    df_raw = load_dataset(HF_TOKEN)
 
-if df.empty:
+if df_raw.empty:
     st.stop()
 
 # ── Freshness check ───────────────────────────────────────────────────────────
-freshness = check_data_freshness(df)
+freshness = check_data_freshness(df_raw)
 show_freshness_status(freshness)
 
 # ── Dataset summary in sidebar ────────────────────────────────────────────────
 with st.sidebar:
     st.divider()
     st.subheader("📦 Dataset Info")
-    summary = dataset_summary(df)
+    summary = dataset_summary(df_raw)
     if summary:
         st.write(f"**Rows:** {summary['rows']:,}")
         st.write(f"**Range:** {summary['start_date']} → {summary['end_date']}")
-        st.write(f"**ETFs:** {', '.join([e.replace('_Ret','') for e in summary['etfs_found']])}")
-        st.write(f"**Benchmarks:** {', '.join([b.replace('_Ret','') for b in summary['benchmarks']])}")
+        st.write(f"**ETFs:** {', '.join(summary['etfs_found'])}")
+        st.write(f"**Benchmarks:** {', '.join(summary['benchmarks'])}")
+        st.write(f"**Macro:** {', '.join(summary['macro_found'])}")
         st.write(f"**T-bill col:** {'✅' if summary['tbill_found'] else '❌'}")
 
-# ── Main execution ────────────────────────────────────────────────────────────
+# ── Wait for run button ───────────────────────────────────────────────────────
 if not run_button:
-    st.info("👈 Configure parameters in the sidebar and click **🚀 Run All 3 Approaches** to begin.")
+    st.info("👈 Configure parameters in the sidebar and click **🚀 Run All 3 Approaches**.")
     st.stop()
 
 # ── Filter by start year ──────────────────────────────────────────────────────
-df = df[df.index.year >= start_yr].copy()
-st.write(f"📅 **Data:** {df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')}  "
-         f"({df.index[-1].year - df.index[0].year + 1} years)")
+df = df_raw[df_raw.index.year >= start_yr].copy()
+st.write(
+    f"📅 **Data:** {df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')}  "
+    f"({df.index[-1].year - df.index[0].year + 1} years)"
+)
 
-# ── Feature / target extraction ───────────────────────────────────────────────
+# ── Features & targets ────────────────────────────────────────────────────────
 try:
-    input_features, target_etfs, tbill_rate = get_features_and_targets(df)
+    input_features, target_etfs, tbill_rate, df = get_features_and_targets(df)
 except ValueError as e:
     st.error(str(e))
     st.stop()
 
-st.info(f"🎯 **Targets:** {len(target_etfs)} ETFs  ·  **Features:** {len(input_features)} signals  ·  "
-        f"**T-bill rate:** {tbill_rate*100:.2f}%")
+n_etfs    = len(target_etfs)
+n_classes = n_etfs + (1 if include_cash else 0)
 
-# ── Prepare sequences ─────────────────────────────────────────────────────────
-X_raw    = df[input_features].values.astype(np.float32)
-y_raw    = df[target_etfs].values.astype(np.float32)
-n_etfs   = len(target_etfs)
-n_classes = n_etfs + (1 if include_cash else 0)   # +1 for CASH
+st.info(
+    f"🎯 **Targets:** {', '.join([t.replace('_Ret','') for t in target_etfs])}  ·  "
+    f"**Features:** {len(input_features)} signals  ·  "
+    f"**T-bill:** {tbill_rate*100:.2f}%"
+)
 
-# Fill NaNs with column means
+# ── Build sequences ───────────────────────────────────────────────────────────
+X_raw = df[input_features].values.astype(np.float32)
+y_raw = df[target_etfs].values.astype(np.float32)
+
+# Fill any remaining NaNs with column means
 col_means = np.nanmean(X_raw, axis=0)
 for j in range(X_raw.shape[1]):
     mask = np.isnan(X_raw[:, j])
-    X_raw[mask, j] = col_means[j]
+    if mask.any():
+        X_raw[mask, j] = col_means[j]
 
 X_seq, y_seq = build_sequences(X_raw, y_raw, lookback)
 y_labels     = returns_to_labels(y_seq, include_cash=include_cash)
 
-X_train, y_train_r, X_val, y_val_r, X_test, y_test_r = train_val_test_split(X_seq, y_seq, train_pct, val_pct)
-_, y_train_l, _, y_val_l, _, y_test_l                 = train_val_test_split(X_seq, y_labels, train_pct, val_pct)
+(X_train, y_train_r, X_val, y_val_r,
+ X_test,  y_test_r)  = train_val_test_split(X_seq, y_seq,    train_pct, val_pct)
+(_,       y_train_l,  _,    y_val_l,
+ _,       y_test_l)  = train_val_test_split(X_seq, y_labels, train_pct, val_pct)
 
 X_train_s, X_val_s, X_test_s, _ = scale_features(X_train, X_val, X_test)
 
 train_size = len(X_train)
 val_size   = len(X_val)
 
-# Test dates (aligned with y_test)
-test_start  = lookback + train_size + val_size
-test_dates  = df.index[test_start: test_start + len(X_test)]
-test_slice  = slice(test_start, test_start + len(X_test))
+test_start = lookback + train_size + val_size
+test_dates = df.index[test_start: test_start + len(X_test)]
+test_slice = slice(test_start, test_start + len(X_test))
 
-st.success(f"✅ Sequences — Train: {train_size} · Val: {val_size} · Test: {len(X_test)}")
+st.success(
+    f"✅ Sequences — Train: {train_size:,} · Val: {val_size:,} · Test: {len(X_test):,}"
+)
 
 # ── Train all three approaches ────────────────────────────────────────────────
 results      = {}
-trained_info = {}   # store extra info needed for conviction
+trained_info = {}
 
 progress = st.progress(0, text="Starting training...")
 
-# ── Approach 1: Wavelet ───────────────────────────────────────────────────────
+# ── Approach 1 ────────────────────────────────────────────────────────────────
 with st.spinner("🌊 Training Approach 1 — Wavelet CNN-LSTM..."):
     try:
         model1, hist1, _ = train_approach1(
@@ -163,7 +179,8 @@ with st.spinner("🌊 Training Approach 1 — Wavelet CNN-LSTM..."):
         )
         preds1, proba1 = predict_approach1(model1, X_test_s)
         results["Approach 1"] = execute_strategy(
-            preds1, proba1, y_test_r, test_dates, target_etfs, fee_bps, tbill_rate, include_cash,
+            preds1, proba1, y_test_r, test_dates,
+            target_etfs, fee_bps, tbill_rate, include_cash,
         )
         trained_info["Approach 1"] = {"proba": proba1}
         st.success("✅ Approach 1 complete")
@@ -173,7 +190,7 @@ with st.spinner("🌊 Training Approach 1 — Wavelet CNN-LSTM..."):
 
 progress.progress(33, text="Approach 1 done...")
 
-# ── Approach 2: Regime-Conditioned ───────────────────────────────────────────
+# ── Approach 2 ────────────────────────────────────────────────────────────────
 with st.spinner("🔀 Training Approach 2 — Regime-Conditioned CNN-LSTM..."):
     try:
         model2, hist2, hmm2, regime_cols2 = train_approach2(
@@ -191,7 +208,8 @@ with st.spinner("🔀 Training Approach 2 — Regime-Conditioned CNN-LSTM..."):
             lookback, train_size, val_size,
         )
         results["Approach 2"] = execute_strategy(
-            preds2, proba2, y_test_r, test_dates, target_etfs, fee_bps, tbill_rate, include_cash,
+            preds2, proba2, y_test_r, test_dates,
+            target_etfs, fee_bps, tbill_rate, include_cash,
         )
         trained_info["Approach 2"] = {"proba": proba2}
         st.success("✅ Approach 2 complete")
@@ -201,7 +219,7 @@ with st.spinner("🔀 Training Approach 2 — Regime-Conditioned CNN-LSTM..."):
 
 progress.progress(66, text="Approach 2 done...")
 
-# ── Approach 3: Multi-Scale ───────────────────────────────────────────────────
+# ── Approach 3 ────────────────────────────────────────────────────────────────
 with st.spinner("📡 Training Approach 3 — Multi-Scale CNN-LSTM..."):
     try:
         model3, hist3 = train_approach3(
@@ -211,7 +229,8 @@ with st.spinner("📡 Training Approach 3 — Multi-Scale CNN-LSTM..."):
         )
         preds3, proba3 = predict_approach3(model3, X_test_s)
         results["Approach 3"] = execute_strategy(
-            preds3, proba3, y_test_r, test_dates, target_etfs, fee_bps, tbill_rate, include_cash,
+            preds3, proba3, y_test_r, test_dates,
+            target_etfs, fee_bps, tbill_rate, include_cash,
         )
         trained_info["Approach 3"] = {"proba": proba3}
         st.success("✅ Approach 3 complete")
@@ -227,15 +246,14 @@ winner_name = select_winner(results)
 winner_res  = results.get(winner_name)
 
 if winner_res is None:
-    st.error("❌ All approaches failed. Please check your data and configuration.")
+    st.error("❌ All approaches failed. Please check data and configuration.")
     st.stop()
 
-# ── Next trading date ─────────────────────────────────────────────────────────
 next_date = get_next_signal_date()
 
 st.divider()
 
-# ── Signal banner (winner) ────────────────────────────────────────────────────
+# ── Signal banner ─────────────────────────────────────────────────────────────
 show_signal_banner(winner_res["next_signal"], next_date, winner_name)
 
 # ── Conviction panel ──────────────────────────────────────────────────────────
@@ -256,7 +274,6 @@ st.subheader("🏆 Approach Comparison (Winner = Highest Raw Annualised Return)"
 comparison_df = build_comparison_table(results, winner_name)
 show_comparison_table(comparison_df)
 
-# ── Comparison bar chart ──────────────────────────────────────────────────────
 st.plotly_chart(comparison_bar_chart(results, winner_name), use_container_width=True)
 
 st.divider()
@@ -268,6 +285,6 @@ st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
 
-# ── Audit trail (winner) ──────────────────────────────────────────────────────
+# ── Audit trail ───────────────────────────────────────────────────────────────
 st.subheader(f"📋 Audit Trail — {winner_name} (Last 20 Trading Days)")
 show_audit_trail(winner_res["audit_trail"])
