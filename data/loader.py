@@ -3,6 +3,10 @@ data/loader.py
 Loads master_data.parquet from HF Dataset.
 Validates freshness against the last NYSE trading day.
 No external pings — all data comes from HF Dataset only.
+
+Actual dataset columns (from parquet inspection):
+  ETFs    : AGG, GLD, SLV, SPY, TBT, TLT, VNQ
+  Macro   : VIX, DXY, T10Y2Y, TBILL_3M, IG_SPREAD, HY_SPREAD
 """
 
 import pandas as pd
@@ -22,31 +26,29 @@ except ImportError:
 DATASET_REPO = "P2SAMAPA/fi-etf-macro-signal-master-data"
 PARQUET_FILE = "master_data.parquet"
 
-# Columns expected in the dataset
-REQUIRED_ETF_COLS   = ["TLT_Ret", "TBT_Ret", "VNQ_Ret", "SLV_Ret", "GLD_Ret"]
-BENCHMARK_COLS      = ["SPY_Ret", "AGG_Ret"]
-TBILL_COL           = "DTB3"          # 3m T-bill column in HF dataset
-TARGET_ETFS         = REQUIRED_ETF_COLS   # 5 targets (no CASH in returns, CASH handled in strategy)
+# ── Actual column names in the dataset ───────────────────────────────────────
+TARGET_ETF_COLS  = ["TLT", "TBT", "VNQ", "SLV", "GLD"]   # traded ETFs
+BENCHMARK_COLS   = ["SPY", "AGG"]                           # chart only
+TBILL_COL        = "TBILL_3M"                               # 3m T-bill rate
+MACRO_COLS       = ["VIX", "DXY", "T10Y2Y", "IG_SPREAD", "HY_SPREAD"]
 
 
 # ── NYSE calendar helpers ─────────────────────────────────────────────────────
 
-def get_last_nyse_trading_day(as_of: datetime = None) -> datetime.date:
-    """Return the most recent NYSE trading day before or on as_of (default: today EST)."""
+def get_last_nyse_trading_day(as_of=None):
+    """Return the most recent NYSE trading day on or before as_of (default: today EST)."""
     est = pytz.timezone("US/Eastern")
     if as_of is None:
         as_of = datetime.now(est)
-
     today = as_of.date()
 
     if NYSE_CAL_AVAILABLE:
         try:
-            nyse = mcal.get_calendar("NYSE")
-            # Look back up to 10 days to find last trading day
+            nyse  = mcal.get_calendar("NYSE")
             start = today - timedelta(days=10)
-            schedule = nyse.schedule(start_date=start, end_date=today)
-            if len(schedule) > 0:
-                return schedule.index[-1].date()
+            sched = nyse.schedule(start_date=start, end_date=today)
+            if len(sched) > 0:
+                return sched.index[-1].date()
         except Exception:
             pass
 
@@ -55,18 +57,6 @@ def get_last_nyse_trading_day(as_of: datetime = None) -> datetime.date:
     while candidate.weekday() >= 5:
         candidate -= timedelta(days=1)
     return candidate
-
-
-def is_nyse_trading_day(date) -> bool:
-    """Return True if date is a NYSE trading day."""
-    if NYSE_CAL_AVAILABLE:
-        try:
-            nyse = mcal.get_calendar("NYSE")
-            schedule = nyse.schedule(start_date=date, end_date=date)
-            return len(schedule) > 0
-        except Exception:
-            pass
-    return date.weekday() < 5
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -88,10 +78,10 @@ def load_dataset(hf_token: str) -> pd.DataFrame:
 
         # Ensure DatetimeIndex
         if not isinstance(df.index, pd.DatetimeIndex):
-            if "Date" in df.columns:
-                df = df.set_index("Date")
-            elif "date" in df.columns:
-                df = df.set_index("date")
+            for col in ["Date", "date", "DATE"]:
+                if col in df.columns:
+                    df = df.set_index(col)
+                    break
             df.index = pd.to_datetime(df.index)
 
         df = df.sort_index()
@@ -107,14 +97,6 @@ def load_dataset(hf_token: str) -> pd.DataFrame:
 def check_data_freshness(df: pd.DataFrame) -> dict:
     """
     Check whether the dataset contains data for the last NYSE trading day.
-
-    Returns a dict:
-        {
-            "fresh": bool,
-            "last_date_in_data": date,
-            "expected_date": date,
-            "message": str
-        }
     """
     if df.empty:
         return {
@@ -126,8 +108,7 @@ def check_data_freshness(df: pd.DataFrame) -> dict:
 
     last_date_in_data = df.index[-1].date()
     expected_date     = get_last_nyse_trading_day()
-
-    fresh = last_date_in_data >= expected_date
+    fresh             = last_date_in_data >= expected_date
 
     if fresh:
         message = f"✅ Dataset is up to date through **{last_date_in_data}**."
@@ -150,66 +131,105 @@ def check_data_freshness(df: pd.DataFrame) -> dict:
 
 def get_features_and_targets(df: pd.DataFrame):
     """
-    Extract input feature columns and target ETF return columns from the dataset.
+    Extract input feature columns and target ETF return columns.
+
+    The dataset stores raw price or return values directly under ticker names.
+    We compute daily log returns for target ETFs if they are not already returns.
 
     Returns:
-        input_features : list of column names
-        target_etfs    : list of ETF return column names (e.g. TLT_Ret)
-        tbill_rate     : latest 3m T-bill rate as a float (annualised, e.g. 0.045)
+        input_features : list of column names to use as model inputs
+        target_etfs    : list of ETF column names (after return computation)
+        tbill_rate     : latest 3m T-bill rate as float (annualised, e.g. 0.045)
+        df             : DataFrame (possibly with new _Ret columns added)
     """
-    # Target ETF return columns
-    target_etfs = [c for c in REQUIRED_ETF_COLS if c in df.columns]
 
-    if not target_etfs:
+    # ── Confirm target ETFs exist ─────────────────────────────────────────────
+    missing = [c for c in TARGET_ETF_COLS if c not in df.columns]
+    if missing:
         raise ValueError(
-            f"No target ETF columns found. Expected: {REQUIRED_ETF_COLS}. "
+            f"Missing ETF columns: {missing}. "
             f"Found in dataset: {list(df.columns)}"
         )
 
-    # Input features: Z-scores, vol, regime, yield curve, credit, rates, VIX terms
-    exclude = set(target_etfs + BENCHMARK_COLS + [TBILL_COL])
+    # ── Build return columns ──────────────────────────────────────────────────
+    # If values look like prices (>5), compute pct returns.
+    # If they already look like small returns (<1 in abs), use as-is.
+    target_etfs = []
+    for col in TARGET_ETF_COLS:
+        ret_col = f"{col}_Ret"
+        if ret_col not in df.columns:
+            sample = df[col].dropna()
+            if len(sample) > 0 and abs(sample.median()) > 1:
+                # Looks like price — compute pct change
+                df[ret_col] = df[col].pct_change()
+            else:
+                # Already returns
+                df[ret_col] = df[col]
+        target_etfs.append(ret_col)
+
+    # Same for benchmarks
+    for col in BENCHMARK_COLS:
+        ret_col = f"{col}_Ret"
+        if ret_col not in df.columns and col in df.columns:
+            sample = df[col].dropna()
+            if len(sample) > 0 and abs(sample.median()) > 1:
+                df[ret_col] = df[col].pct_change()
+            else:
+                df[ret_col] = df[col]
+
+    # Drop rows with NaN in target columns (first row after pct_change)
+    df = df.dropna(subset=target_etfs)
+
+    # ── Input features ────────────────────────────────────────────────────────
+    # Use macro columns directly; exclude ETF price/return cols and benchmarks
+    exclude = set(
+        TARGET_ETF_COLS + BENCHMARK_COLS +
+        target_etfs +
+        [f"{c}_Ret" for c in BENCHMARK_COLS] +
+        [TBILL_COL]
+    )
+
     input_features = [
         c for c in df.columns
         if c not in exclude
-        and (
-            c.endswith("_Z")
-            or c.endswith("_Vol")
-            or "Regime" in c
-            or "YC_"    in c
-            or "Credit_" in c
-            or "Rates_"  in c
-            or "VIX_"    in c
-            or "Spread"  in c
-            or "DXY"     in c
-            or "VIX"     in c
-            or "T10Y"    in c
-        )
+        and c in (MACRO_COLS + [
+            col for col in df.columns
+            if any(k in col for k in ["_Z", "_Vol", "Regime", "YC_", "Credit_",
+                                       "Rates_", "VIX_", "Spread", "DXY", "T10Y"])
+        ])
     ]
 
-    # 3m T-bill rate (for CASH return & Sharpe)
-    tbill_rate = 0.045   # default fallback
+    # Fallback: if none matched, use all non-excluded numeric columns
+    if not input_features:
+        input_features = [
+            c for c in df.columns
+            if c not in exclude
+            and pd.api.types.is_numeric_dtype(df[c])
+        ]
+
+    # ── T-bill rate ───────────────────────────────────────────────────────────
+    tbill_rate = 0.045   # default
     if TBILL_COL in df.columns:
         raw = df[TBILL_COL].dropna()
         if len(raw) > 0:
-            last_val = raw.iloc[-1]
-            # DTB3 is typically in percent (e.g. 5.25 means 5.25%)
-            tbill_rate = float(last_val) / 100 if last_val > 1 else float(last_val)
+            last_val   = float(raw.iloc[-1])
+            tbill_rate = last_val / 100 if last_val > 1 else last_val
 
-    return input_features, target_etfs, tbill_rate
+    return input_features, target_etfs, tbill_rate, df
 
 
-# ── Column info helper (for sidebar display) ──────────────────────────────────
+# ── Dataset summary ───────────────────────────────────────────────────────────
 
 def dataset_summary(df: pd.DataFrame) -> dict:
-    """Return a brief summary dict for sidebar display."""
     if df.empty:
         return {}
     return {
-        "rows":       len(df),
-        "columns":    len(df.columns),
-        "start_date": df.index[0].strftime("%Y-%m-%d"),
-        "end_date":   df.index[-1].strftime("%Y-%m-%d"),
-        "etfs_found": [c for c in REQUIRED_ETF_COLS if c in df.columns],
-        "benchmarks": [c for c in BENCHMARK_COLS     if c in df.columns],
+        "rows":        len(df),
+        "columns":     len(df.columns),
+        "start_date":  df.index[0].strftime("%Y-%m-%d"),
+        "end_date":    df.index[-1].strftime("%Y-%m-%d"),
+        "etfs_found":  [c for c in TARGET_ETF_COLS  if c in df.columns],
+        "benchmarks":  [c for c in BENCHMARK_COLS   if c in df.columns],
+        "macro_found": [c for c in MACRO_COLS        if c in df.columns],
         "tbill_found": TBILL_COL in df.columns,
     }
