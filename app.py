@@ -9,7 +9,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-# ── Module imports ────────────────────────────────────────────────────────────
 from data.loader      import (load_dataset, check_data_freshness,
                                get_features_and_targets, dataset_summary)
 from utils.calendar   import get_est_time, is_sync_window, get_next_signal_date
@@ -26,47 +25,31 @@ from ui.components import (
 )
 from ui.charts import equity_curve_chart, comparison_bar_chart
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="P2-ETF-CNN-LSTM",
-    page_icon="🧠",
-    layout="wide",
-)
+st.set_page_config(page_title="P2-ETF-CNN-LSTM", page_icon="🧠", layout="wide")
 
-# ── Secrets ───────────────────────────────────────────────────────────────────
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Configuration")
-
     now_est = get_est_time()
     st.write(f"🕒 **EST:** {now_est.strftime('%H:%M:%S')}")
-    if is_sync_window():
-        st.success("✅ Sync Window Active")
-    else:
-        st.info("⏸️ Sync Window Inactive")
+    st.success("✅ Sync Window Active") if is_sync_window() else st.info("⏸️ Sync Window Inactive")
 
     st.divider()
-
     start_yr     = st.slider("📅 Start Year", 2010, 2024, 2016)
     fee_bps      = st.slider("💰 Fee (bps)", 0, 50, 10)
     lookback     = st.slider("📐 Lookback (days)", 20, 60, 30, step=5)
     epochs       = st.number_input("🔁 Max Epochs", 20, 300, 100, step=10)
 
     st.divider()
-
     split_option = st.selectbox("📊 Train/Val/Test Split", ["70/15/15", "80/10/10"], index=0)
-    split_map    = {"70/15/15": (0.70, 0.15), "80/10/10": (0.80, 0.10)}
-    train_pct, val_pct = split_map[split_option]
+    train_pct, val_pct = {"70/15/15": (0.70, 0.15), "80/10/10": (0.80, 0.10)}[split_option]
 
-    include_cash = st.checkbox(
-        "💵 Include CASH class", value=True,
-        help="Model can select CASH (earns T-bill rate) instead of any ETF",
-    )
+    include_cash = st.checkbox("💵 Include CASH class", value=True,
+        help="Model can select CASH (earns T-bill rate) instead of any ETF")
 
     st.divider()
-
     run_button = st.button("🚀 Run All 3 Approaches", type="primary", use_container_width=True)
 
 # ── Title ─────────────────────────────────────────────────────────────────────
@@ -74,9 +57,8 @@ st.title("🧠 P2-ETF-CNN-LSTM")
 st.caption("Approach 1: Wavelet  ·  Approach 2: Regime-Conditioned  ·  Approach 3: Multi-Scale Parallel")
 st.caption("Winner selected by highest raw annualised return on out-of-sample test set.")
 
-# ── Token check ───────────────────────────────────────────────────────────────
 if not HF_TOKEN:
-    st.error("❌ HF_TOKEN secret not found. Add it to HF Space / GitHub secrets.")
+    st.error("❌ HF_TOKEN secret not found.")
     st.stop()
 
 # ── Load dataset ──────────────────────────────────────────────────────────────
@@ -86,11 +68,10 @@ with st.spinner("📡 Loading dataset from HuggingFace..."):
 if df_raw.empty:
     st.stop()
 
-# ── Freshness check ───────────────────────────────────────────────────────────
 freshness = check_data_freshness(df_raw)
 show_freshness_status(freshness)
 
-# ── Dataset summary in sidebar ────────────────────────────────────────────────
+# ── Dataset info sidebar ──────────────────────────────────────────────────────
 with st.sidebar:
     st.divider()
     st.subheader("📦 Dataset Info")
@@ -103,27 +84,39 @@ with st.sidebar:
         st.write(f"**Macro:** {', '.join(summary['macro_found'])}")
         st.write(f"**T-bill col:** {'✅' if summary['tbill_found'] else '❌'}")
 
-# ── Wait for run button ───────────────────────────────────────────────────────
+        with st.expander("🔍 All columns"):
+            st.write(summary["all_cols"])
+
 if not run_button:
-    st.info("👈 Configure parameters in the sidebar and click **🚀 Run All 3 Approaches**.")
+    st.info("👈 Configure parameters and click **🚀 Run All 3 Approaches**.")
     st.stop()
 
 # ── Filter by start year ──────────────────────────────────────────────────────
 df = df_raw[df_raw.index.year >= start_yr].copy()
-st.write(
-    f"📅 **Data:** {df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')}  "
-    f"({df.index[-1].year - df.index[0].year + 1} years)"
-)
+st.write(f"📅 **Data:** {df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')} "
+         f"({df.index[-1].year - df.index[0].year + 1} years)")
 
 # ── Features & targets ────────────────────────────────────────────────────────
 try:
-    input_features, target_etfs, tbill_rate, df = get_features_and_targets(df)
+    input_features, target_etfs, tbill_rate, df, col_info = get_features_and_targets(df)
 except ValueError as e:
     st.error(str(e))
     st.stop()
 
 n_etfs    = len(target_etfs)
 n_classes = n_etfs + (1 if include_cash else 0)
+
+# ── Show column detection diagnostics ────────────────────────────────────────
+with st.expander("🔬 Column detection diagnostics", expanded=False):
+    st.write("**How each ETF column was interpreted:**")
+    for col, info in col_info.items():
+        st.write(f"- `{col}`: {info}")
+    st.write(f"**Input features ({len(input_features)}):** {input_features}")
+    st.write(f"**T-bill rate used:** {tbill_rate*100:.3f}%")
+
+    # Show sample return values to verify correctness
+    st.write("**Sample target return values (last 3 rows):**")
+    st.dataframe(df[target_etfs].tail(3))
 
 st.info(
     f"🎯 **Targets:** {', '.join([t.replace('_Ret','') for t in target_etfs])}  ·  "
@@ -135,12 +128,19 @@ st.info(
 X_raw = df[input_features].values.astype(np.float32)
 y_raw = df[target_etfs].values.astype(np.float32)
 
-# Fill any remaining NaNs with column means
+# Fill NaNs
 col_means = np.nanmean(X_raw, axis=0)
 for j in range(X_raw.shape[1]):
     mask = np.isnan(X_raw[:, j])
     if mask.any():
         X_raw[mask, j] = col_means[j]
+
+# Also fill NaNs in y_raw
+y_means = np.nanmean(y_raw, axis=0)
+for j in range(y_raw.shape[1]):
+    mask = np.isnan(y_raw[:, j])
+    if mask.any():
+        y_raw[mask, j] = y_means[j]
 
 X_seq, y_seq = build_sequences(X_raw, y_raw, lookback)
 y_labels     = returns_to_labels(y_seq, include_cash=include_cash)
@@ -154,27 +154,30 @@ X_train_s, X_val_s, X_test_s, _ = scale_features(X_train, X_val, X_test)
 
 train_size = len(X_train)
 val_size   = len(X_val)
-
 test_start = lookback + train_size + val_size
 test_dates = df.index[test_start: test_start + len(X_test)]
 test_slice = slice(test_start, test_start + len(X_test))
 
-st.success(
-    f"✅ Sequences — Train: {train_size:,} · Val: {val_size:,} · Test: {len(X_test):,}"
-)
+st.success(f"✅ Sequences — Train: {train_size:,} · Val: {val_size:,} · Test: {len(X_test):,}")
+
+# Show class distribution to check for degenerate labels
+with st.expander("🔬 Label distribution (train set)", expanded=False):
+    unique, counts = np.unique(y_train_l, return_counts=True)
+    label_names = [target_etfs[i].replace("_Ret","") if i < n_etfs else "CASH" for i in unique]
+    dist_df = pd.DataFrame({"Class": label_names, "Count": counts,
+                             "Pct": (counts / counts.sum() * 100).round(1)})
+    st.dataframe(dist_df)
 
 # ── Train all three approaches ────────────────────────────────────────────────
 results      = {}
 trained_info = {}
+progress     = st.progress(0, text="Starting training...")
 
-progress = st.progress(0, text="Starting training...")
-
-# ── Approach 1 ────────────────────────────────────────────────────────────────
+# Approach 1
 with st.spinner("🌊 Training Approach 1 — Wavelet CNN-LSTM..."):
     try:
         model1, hist1, _ = train_approach1(
-            X_train_s, y_train_l,
-            X_val_s,   y_val_l,
+            X_train_s, y_train_l, X_val_s, y_val_l,
             n_classes=n_classes, epochs=int(epochs),
         )
         preds1, proba1 = predict_approach1(model1, X_test_s)
@@ -190,17 +193,13 @@ with st.spinner("🌊 Training Approach 1 — Wavelet CNN-LSTM..."):
 
 progress.progress(33, text="Approach 1 done...")
 
-# ── Approach 2 ────────────────────────────────────────────────────────────────
+# Approach 2
 with st.spinner("🔀 Training Approach 2 — Regime-Conditioned CNN-LSTM..."):
     try:
         model2, hist2, hmm2, regime_cols2 = train_approach2(
-            X_train_s, y_train_l,
-            X_val_s,   y_val_l,
-            X_flat_all=X_raw,
-            feature_names=input_features,
-            lookback=lookback,
-            train_size=train_size,
-            val_size=val_size,
+            X_train_s, y_train_l, X_val_s, y_val_l,
+            X_flat_all=X_raw, feature_names=input_features,
+            lookback=lookback, train_size=train_size, val_size=val_size,
             n_classes=n_classes, epochs=int(epochs),
         )
         preds2, proba2 = predict_approach2(
@@ -219,12 +218,11 @@ with st.spinner("🔀 Training Approach 2 — Regime-Conditioned CNN-LSTM..."):
 
 progress.progress(66, text="Approach 2 done...")
 
-# ── Approach 3 ────────────────────────────────────────────────────────────────
+# Approach 3
 with st.spinner("📡 Training Approach 3 — Multi-Scale CNN-LSTM..."):
     try:
         model3, hist3 = train_approach3(
-            X_train_s, y_train_l,
-            X_val_s,   y_val_l,
+            X_train_s, y_train_l, X_val_s, y_val_l,
             n_classes=n_classes, epochs=int(epochs),
         )
         preds3, proba3 = predict_approach3(model3, X_test_s)
@@ -250,41 +248,29 @@ if winner_res is None:
     st.stop()
 
 next_date = get_next_signal_date()
-
 st.divider()
 
-# ── Signal banner ─────────────────────────────────────────────────────────────
 show_signal_banner(winner_res["next_signal"], next_date, winner_name)
 
-# ── Conviction panel ──────────────────────────────────────────────────────────
 winner_proba = trained_info[winner_name]["proba"]
 conviction   = compute_conviction(winner_proba[-1], target_etfs, include_cash)
 show_conviction_panel(conviction)
 
 st.divider()
-
-# ── Winner metrics ────────────────────────────────────────────────────────────
 st.subheader(f"📊 {winner_name} — Performance Metrics")
 show_metrics_row(winner_res, tbill_rate)
 
 st.divider()
-
-# ── Comparison table ──────────────────────────────────────────────────────────
 st.subheader("🏆 Approach Comparison (Winner = Highest Raw Annualised Return)")
 comparison_df = build_comparison_table(results, winner_name)
 show_comparison_table(comparison_df)
-
 st.plotly_chart(comparison_bar_chart(results, winner_name), use_container_width=True)
 
 st.divider()
-
-# ── Equity curves ─────────────────────────────────────────────────────────────
 st.subheader("📈 Out-of-Sample Equity Curves — All Approaches vs Benchmarks")
 fig = equity_curve_chart(results, winner_name, test_dates, df, test_slice, tbill_rate)
 st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
-
-# ── Audit trail ───────────────────────────────────────────────────────────────
 st.subheader(f"📋 Audit Trail — {winner_name} (Last 20 Trading Days)")
 show_audit_trail(winner_res["audit_trail"])
