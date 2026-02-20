@@ -1,0 +1,229 @@
+"""
+ui/components.py
+Reusable Streamlit UI blocks:
+  - Freshness warning banner
+  - Next trading day signal banner
+  - Signal conviction panel
+  - Metrics row
+  - Audit trail table
+  - Comparison summary table
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+
+from signals.conviction import conviction_color, conviction_icon
+
+
+# ── Freshness warning ─────────────────────────────────────────────────────────
+
+def show_freshness_status(freshness: dict):
+    """Display data freshness status. Stops app if data is stale."""
+    if freshness.get("fresh"):
+        st.success(freshness["message"])
+    else:
+        st.warning(freshness["message"])
+
+
+# ── Next trading day banner ───────────────────────────────────────────────────
+
+def show_signal_banner(next_signal: str, next_date, approach_name: str):
+    """Large coloured banner showing the winning approach's next signal."""
+    is_cash = next_signal == "CASH"
+    bg      = "linear-gradient(135deg, #2d3436 0%, #1a1a2e 100%)" if is_cash else \
+              "linear-gradient(135deg, #00d1b2 0%, #00a896 100%)"
+
+    st.markdown(f"""
+    <div style="background:{bg}; padding:25px; border-radius:15px;
+                text-align:center; box-shadow:0 8px 16px rgba(0,0,0,0.3);
+                margin:16px 0;">
+      <div style="color:rgba(255,255,255,0.7); font-size:12px;
+                  letter-spacing:3px; margin-bottom:6px;">
+        {approach_name.upper()} · NEXT TRADING DAY SIGNAL
+      </div>
+      <h1 style="color:white; font-size:44px; margin:0 0 8px 0;
+                 font-weight:800; text-shadow:2px 2px 4px rgba(0,0,0,0.3);">
+        🎯 {next_date.strftime('%Y-%m-%d')} → {next_signal}
+      </h1>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ── Signal conviction panel ───────────────────────────────────────────────────
+
+def show_conviction_panel(conviction: dict):
+    """
+    White-background conviction panel with Z-score gauge and per-ETF bars.
+    Uses separate st.markdown calls per ETF row to avoid Streamlit HTML escaping.
+    """
+    label      = conviction["label"]
+    z_score    = conviction["z_score"]
+    best_name  = conviction["best_name"]
+    sorted_pairs = conviction["sorted_pairs"]
+
+    color      = conviction_color(label)
+    icon       = conviction_icon(label)
+
+    z_clipped  = max(-3.0, min(3.0, z_score))
+    bar_pct    = int((z_clipped + 3) / 6 * 100)
+
+    max_score  = max(s for _, s in sorted_pairs) if sorted_pairs else 1.0
+    if max_score <= 0:
+        max_score = 1.0
+
+    # ── Header + gauge ────────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="background:#ffffff; border:1px solid #ddd;
+                border-left:5px solid {color}; border-radius:12px 12px 0 0;
+                padding:18px 24px 12px 24px; margin:12px 0 0 0;
+                box-shadow:0 2px 8px rgba(0,0,0,0.07);">
+
+      <div style="display:flex; align-items:center; gap:12px;
+                  margin-bottom:14px; flex-wrap:wrap;">
+        <span style="font-size:20px;">{icon}</span>
+        <span style="font-size:18px; font-weight:700; color:#1a1a1a;">Signal Conviction</span>
+        <span style="background:#f0f0f0; border:1px solid {color};
+                     color:{color}; font-weight:700; font-size:14px;
+                     padding:3px 12px; border-radius:8px;">
+          Z = {z_score:.2f} &sigma;
+        </span>
+        <span style="margin-left:auto; background:{color}; color:#fff;
+                     font-weight:700; padding:4px 16px;
+                     border-radius:20px; font-size:13px;">
+          {label}
+        </span>
+      </div>
+
+      <div style="display:flex; justify-content:space-between;
+                  font-size:11px; color:#999; margin-bottom:4px;">
+        <span>Weak &minus;3&sigma;</span>
+        <span>Neutral 0&sigma;</span>
+        <span>Strong +3&sigma;</span>
+      </div>
+      <div style="background:#f0f0f0; border-radius:8px; height:14px;
+                  overflow:hidden; position:relative; border:1px solid #e0e0e0;
+                  margin-bottom:14px;">
+        <div style="position:absolute; left:50%; top:0; width:2px;
+                    height:100%; background:#ccc;"></div>
+        <div style="width:{bar_pct}%; height:100%;
+                    background:linear-gradient(90deg,#fab1a0,{color});
+                    border-radius:8px;"></div>
+      </div>
+
+      <div style="font-size:12px; color:#999; margin-bottom:2px;">
+        Model probability by ETF (ranked high &rarr; low):
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Per-ETF rows ──────────────────────────────────────────────────────────
+    for i, (name, score) in enumerate(sorted_pairs):
+        is_winner  = (name == best_name)
+        is_last    = (i == len(sorted_pairs) - 1)
+        bar_w      = int(score / max_score * 100)
+        name_style = "font-weight:700; color:#00897b;" if is_winner else "color:#444;"
+        bar_color  = color if is_winner else "#b2dfdb" if score > max_score * 0.5 else "#e0e0e0"
+        star       = " ★" if is_winner else ""
+        bottom_r   = "0 0 12px 12px" if is_last else "0"
+        border_bot = "border-bottom:1px solid #f0f0f0;" if not is_last else ""
+
+        st.markdown(f"""
+        <div style="background:#ffffff; border:1px solid #ddd; border-top:none;
+                    border-radius:{bottom_r}; padding:7px 24px; {border_bot}
+                    box-shadow:0 2px 8px rgba(0,0,0,0.07);">
+          <div style="display:flex; align-items:center; gap:12px;">
+            <span style="width:44px; text-align:right; font-size:13px; {name_style}">{name}{star}</span>
+            <div style="flex:1; background:#f5f5f5; border-radius:4px;
+                        height:14px; overflow:hidden; border:1px solid #e8e8e8;">
+              <div style="width:{bar_w}%; height:100%;
+                          background:{bar_color}; border-radius:4px;"></div>
+            </div>
+            <span style="width:56px; font-size:12px; color:#888; text-align:right;">{score:.4f}</span>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.caption(
+        "Z-score = std deviations the top ETF's probability sits above the mean of all ETF probabilities. "
+        "Higher → model is more decisive."
+    )
+
+
+# ── Metrics row ───────────────────────────────────────────────────────────────
+
+def show_metrics_row(result: dict, tbill_rate: float):
+    """Five-column metric display."""
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    col1.metric(
+        "📈 Annualised Return",
+        f"{result['ann_return']*100:.2f}%",
+        delta=f"vs T-bill: {(result['ann_return'] - tbill_rate)*100:.2f}%",
+    )
+    col2.metric(
+        "📊 Sharpe Ratio",
+        f"{result['sharpe']:.2f}",
+        delta="Risk-Adjusted" if result['sharpe'] > 1 else "Below Threshold",
+    )
+    col3.metric(
+        "🎯 Hit Ratio (15d)",
+        f"{result['hit_ratio']*100:.0f}%",
+        delta="Strong" if result['hit_ratio'] > 0.6 else "Weak",
+    )
+    col4.metric(
+        "📉 Max Drawdown",
+        f"{result['max_dd']*100:.2f}%",
+        delta="Peak to Trough",
+    )
+    col5.metric(
+        "⚠️ Max Daily DD",
+        f"{result['max_daily_dd']*100:.2f}%",
+        delta="Worst Day",
+    )
+
+
+# ── Comparison table ──────────────────────────────────────────────────────────
+
+def show_comparison_table(comparison_df: pd.DataFrame):
+    """Styled comparison table for all three approaches."""
+    def highlight_winner(row):
+        if "WINNER" in str(row.get("Winner", "")):
+            return ["background-color: rgba(0,200,150,0.15); font-weight:bold"] * len(row)
+        return [""] * len(row)
+
+    styled = comparison_df.style.apply(highlight_winner, axis=1).set_properties(**{
+        "text-align": "center",
+        "font-size": "14px",
+    }).set_table_styles([
+        {"selector": "th", "props": [("font-size", "14px"), ("font-weight", "bold"),
+                                      ("text-align", "center")]},
+        {"selector": "td", "props": [("padding", "10px")]},
+    ])
+    st.dataframe(styled, use_container_width=True)
+
+
+# ── Audit trail ───────────────────────────────────────────────────────────────
+
+def show_audit_trail(audit_trail: list):
+    """Last 20 days styled audit trail."""
+    if not audit_trail:
+        st.info("No audit trail data available.")
+        return
+
+    df = pd.DataFrame(audit_trail).tail(20)[["Date", "Signal", "Net_Return"]]
+
+    def color_return(val):
+        return "color: #00c896; font-weight:bold" if val > 0 else "color: #ff4b4b; font-weight:bold"
+
+    styled = df.style.applymap(color_return, subset=["Net_Return"]).format(
+        {"Net_Return": "{:.2%}"}
+    ).set_properties(**{
+        "font-size": "16px",
+        "text-align": "center",
+    }).set_table_styles([
+        {"selector": "th", "props": [("font-size", "16px"), ("font-weight", "bold"),
+                                      ("text-align", "center")]},
+        {"selector": "td", "props": [("padding", "10px")]},
+    ])
+    st.dataframe(styled, use_container_width=True, height=500)
