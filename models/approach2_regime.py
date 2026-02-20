@@ -166,7 +166,7 @@ def train_approach2(
     Fit HMM regime model then train the regime-conditioned CNN-LSTM.
     Returns: model, history, hmm_model, regime_cols_idx
     """
-    from models.base import get_callbacks
+    from models.base import get_callbacks, compute_class_weights
 
     X_flat_train = X_flat_all[:train_size + lookback]
     hmm_model, regime_cols_idx = fit_regime_model(X_flat_train, feature_names)
@@ -181,11 +181,14 @@ def train_approach2(
         dropout=dropout, lstm_units=lstm_units,
     )
 
+    cw = compute_class_weights(y_train, n_classes)
+
     history = model.fit(
         [X_train, R_train], y_train,
         validation_data=([X_val, R_val], y_val),
         epochs=epochs,
         batch_size=batch_size,
+        class_weight=cw,
         callbacks=get_callbacks(),
         verbose=0,
     )
