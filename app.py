@@ -34,7 +34,10 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     now_est = get_est_time()
     st.write(f"🕒 **EST:** {now_est.strftime('%H:%M:%S')}")
-    st.success("✅ Sync Window Active") if is_sync_window() else st.info("⏸️ Sync Window Inactive")
+    if is_sync_window():
+        st.success("✅ Sync Window Active")
+    else:
+        st.info("⏸️ Sync Window Inactive")
 
     st.divider()
     start_yr     = st.slider("📅 Start Year", 2010, 2024, 2016)
