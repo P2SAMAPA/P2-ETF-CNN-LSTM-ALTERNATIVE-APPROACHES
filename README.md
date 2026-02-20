@@ -1,3 +1,15 @@
+---
+title: P2-ETF-CNN-LSTM-ALTERNATIVE-APPROACHES
+emoji: 🧠
+colorFrom: green
+colorTo: blue
+sdk: streamlit
+sdk_version: "1.32.0"
+python_version: "3.10"
+app_file: app.py
+pinned: false
+---
+
 # P2-ETF-CNN-LSTM-ALTERNATIVE-APPROACHES
 
 Macro-driven ETF rotation using three augmented CNN-LSTM variants.  
