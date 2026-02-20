@@ -1,0 +1,42 @@
+name: Sync to Hugging Face Space
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  sync-to-hf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "GitHub Actions"
+
+          # Clone HF Space
+          git clone https://P2SAMAPA:${HF_TOKEN}@huggingface.co/spaces/P2SAMAPA/P2-ETF-CNN-LSTM-ALTERNATIVE-APPROACHES hf_space
+
+          # Copy all repo files into HF Space clone (excluding .git and .github)
+          rsync -av --exclude='.git' --exclude='.github' ./ hf_space/
+
+          cd hf_space
+
+          git add -A
+
+          # Only commit+push if there are changes
+          if git diff --cached --quiet; then
+            echo "No changes to sync."
+          else
+            git commit -m "Sync from GitHub: ${{ github.sha }}"
+            git push
+          fi
