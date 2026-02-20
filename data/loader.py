@@ -1,12 +1,8 @@
 """
 data/loader.py
 Loads master_data.parquet from HF Dataset.
-Validates freshness against the last NYSE trading day.
-No external pings — all data comes from HF Dataset only.
-
-Actual dataset columns (confirmed from parquet inspection):
-  ETFs    : AGG, GLD, SLV, SPY, TBT, TLT, VNQ
-  Macro   : VIX, DXY, T10Y2Y, TBILL_3M, IG_SPREAD, HY_SPREAD
+Engineers rich feature set from raw price/macro columns.
+No external pings — all data from HF Dataset only.
 """
 
 import pandas as pd
@@ -22,9 +18,8 @@ try:
 except ImportError:
     NYSE_CAL_AVAILABLE = False
 
-DATASET_REPO = "P2SAMAPA/fi-etf-macro-signal-master-data"
-PARQUET_FILE = "master_data.parquet"
-
+DATASET_REPO    = "P2SAMAPA/fi-etf-macro-signal-master-data"
+PARQUET_FILE    = "master_data.parquet"
 TARGET_ETF_COLS = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
 BENCHMARK_COLS  = ["SPY", "AGG"]
 TBILL_COL       = "TBILL_3M"
@@ -64,16 +59,13 @@ def load_dataset(hf_token: str) -> pd.DataFrame:
             token=hf_token,
         )
         df = pd.read_parquet(path)
-
         if not isinstance(df.index, pd.DatetimeIndex):
             for col in ["Date", "date", "DATE"]:
                 if col in df.columns:
                     df = df.set_index(col)
                     break
             df.index = pd.to_datetime(df.index)
-
         return df.sort_index()
-
     except Exception as e:
         st.error(f"❌ Failed to load dataset: {e}")
         return pd.DataFrame()
@@ -84,11 +76,9 @@ def load_dataset(hf_token: str) -> pd.DataFrame:
 def check_data_freshness(df: pd.DataFrame) -> dict:
     if df.empty:
         return {"fresh": False, "message": "Dataset is empty."}
-
     last   = df.index[-1].date()
     expect = get_last_nyse_trading_day()
     fresh  = last >= expect
-
     msg = (
         f"✅ Dataset up to date through **{last}**." if fresh else
         f"⚠️ **{expect}** data not yet updated. Latest: **{last}**. "
@@ -98,106 +88,139 @@ def check_data_freshness(df: pd.DataFrame) -> dict:
             "expected_date": expect, "message": msg}
 
 
-# ── Detect whether a column holds prices or returns ───────────────────────────
+# ── Price → returns ───────────────────────────────────────────────────────────
 
-def _is_price_series(series: pd.Series) -> bool:
-    """
-    Heuristic: a price series has abs(median) > 2 and std/mean < 0.5.
-    A return series has abs(median) < 0.1 and many values near zero.
-    """
+def _to_returns(series: pd.Series) -> pd.Series:
+    """Convert price series to daily pct returns. If already returns, pass through."""
     clean = series.dropna()
     if len(clean) == 0:
-        return False
-    med = abs(clean.median())
-    # Strong price signal: median > 2 (e.g. TLT ~ 90, TBT ~ 20)
-    if med > 2:
-        return True
-    # Strong return signal: most values between -0.2 and 0.2
-    if (clean.abs() < 0.2).mean() > 0.9:
-        return False
-    return med > 0.5
+        return series
+    if abs(clean.median()) > 2:          # price series
+        return series.pct_change()
+    return series                         # already returns
 
 
-# ── Feature / target extraction ───────────────────────────────────────────────
+# ── Feature engineering ───────────────────────────────────────────────────────
+
+def _engineer_features(df: pd.DataFrame, ret_cols: list) -> pd.DataFrame:
+    """
+    Build a rich feature set from raw macro + ETF return columns.
+
+    Features added per ETF return:
+      - 1d, 5d, 21d lagged returns
+      - 5d, 21d rolling volatility
+      - 5d, 21d momentum (cumulative return)
+
+    Features added per macro column:
+      - raw value (z-scored over rolling 252d window)
+      - 5d change
+      - 1d lag
+
+    Also adds:
+      - TBILL_3M as a feature (rate level)
+      - VIX regime flag (VIX > 25)
+      - Yield curve slope (already T10Y2Y)
+      - Cross-asset momentum: spread between TLT_ret and TBT_ret
+    """
+    feat = pd.DataFrame(index=df.index)
+
+    # ── ETF return features ───────────────────────────────────────────────────
+    for col in ret_cols:
+        r = df[col]
+        feat[f"{col}_lag1"]  = r.shift(1)
+        feat[f"{col}_lag5"]  = r.shift(5)
+        feat[f"{col}_lag21"] = r.shift(21)
+        feat[f"{col}_vol5"]  = r.rolling(5).std()
+        feat[f"{col}_vol21"] = r.rolling(21).std()
+        feat[f"{col}_mom5"]  = r.rolling(5).sum()
+        feat[f"{col}_mom21"] = r.rolling(21).sum()
+
+    # ── Macro features ────────────────────────────────────────────────────────
+    for col in MACRO_COLS:
+        if col not in df.columns:
+            continue
+        s = df[col]
+        # Z-score over rolling 252-day window
+        roll_mean = s.rolling(252, min_periods=63).mean()
+        roll_std  = s.rolling(252, min_periods=63).std()
+        feat[f"{col}_z"]     = (s - roll_mean) / (roll_std + 1e-9)
+        feat[f"{col}_chg5"]  = s.diff(5)
+        feat[f"{col}_lag1"]  = s.shift(1)
+
+    # ── TBILL level ───────────────────────────────────────────────────────────
+    if TBILL_COL in df.columns:
+        tbill = df[TBILL_COL]
+        feat["TBILL_level"] = tbill
+        feat["TBILL_chg5"]  = tbill.diff(5)
+
+    # ── Derived cross-asset signals ───────────────────────────────────────────
+    if "TLT_Ret" in df.columns and "TBT_Ret" in df.columns:
+        feat["TLT_TBT_spread_mom5"] = (
+            df["TLT_Ret"].rolling(5).sum() - df["TBT_Ret"].rolling(5).sum()
+        )
+
+    if "VIX" in df.columns:
+        feat["VIX_regime"] = (df["VIX"] > 25).astype(float)
+        feat["VIX_mom5"]   = df["VIX"].diff(5)
+
+    if "T10Y2Y" in df.columns:
+        feat["YC_inverted"] = (df["T10Y2Y"] < 0).astype(float)
+
+    if "IG_SPREAD" in df.columns and "HY_SPREAD" in df.columns:
+        feat["credit_ratio"] = df["HY_SPREAD"] / (df["IG_SPREAD"] + 1e-9)
+
+    return feat
+
+
+# ── Main extraction function ──────────────────────────────────────────────────
 
 def get_features_and_targets(df: pd.DataFrame):
     """
-    Build return columns for target ETFs and benchmarks.
-    Auto-detects whether source columns are prices or already returns.
+    Build return columns for target ETFs and engineer a rich feature set.
 
     Returns:
         input_features : list[str]
         target_etfs    : list[str]  e.g. ["TLT_Ret", ...]
         tbill_rate     : float
-        df             : DataFrame with _Ret columns added
-        col_info       : dict of diagnostics for sidebar display
+        df_out         : DataFrame with all columns
+        col_info       : dict of diagnostics
     """
     missing = [c for c in TARGET_ETF_COLS if c not in df.columns]
     if missing:
         raise ValueError(
             f"Missing ETF columns: {missing}. "
-            f"Found in dataset: {list(df.columns)}"
+            f"Found: {list(df.columns)}"
         )
 
     col_info = {}
 
-    # ── Build _Ret columns ────────────────────────────────────────────────────
-    def make_ret(col):
+    # ── Build ETF return columns ──────────────────────────────────────────────
+    target_etfs = []
+    for col in TARGET_ETF_COLS:
         ret_col = f"{col}_Ret"
-        if ret_col in df.columns:
-            col_info[col] = "pre-computed _Ret"
-            return ret_col
-        if _is_price_series(df[col]):
-            df[ret_col] = df[col].pct_change()
-            col_info[col] = f"price→pct_change (median={df[col].median():.2f})"
-        else:
-            df[ret_col] = df[col]
-            col_info[col] = f"used as-is (median={df[col].median():.4f})"
-        return ret_col
+        df[ret_col] = _to_returns(df[col])
+        med = abs(df[col].dropna().median())
+        col_info[col] = f"price→pct_change (median={med:.2f})" if med > 2 else f"used as-is (median={med:.4f})"
+        target_etfs.append(ret_col)
 
-    target_etfs    = [make_ret(c) for c in TARGET_ETF_COLS]
-    benchmark_rets = [make_ret(c) for c in BENCHMARK_COLS if c in df.columns]
+    # ── Build benchmark return columns ────────────────────────────────────────
+    for col in BENCHMARK_COLS:
+        if col in df.columns:
+            df[f"{col}_Ret"] = _to_returns(df[col])
 
-    # Drop NaN rows (first row from pct_change)
+    # ── Drop NaN from first pct_change row ────────────────────────────────────
     df = df.dropna(subset=target_etfs).copy()
 
-    # Sanity check: target returns should be small daily values
-    for ret_col in target_etfs:
-        med = df[ret_col].abs().median()
-        if med > 0.1:
-            st.warning(
-                f"⚠️ {ret_col} has median absolute value {med:.4f} — "
-                f"these may not be daily returns. Check dataset column '{ret_col.replace('_Ret','')}'. "
-                f"Sample values: {df[ret_col].tail(3).values}"
-            )
+    # ── Engineer features ─────────────────────────────────────────────────────
+    feat_df = _engineer_features(df, target_etfs)
 
-    # ── Input features ────────────────────────────────────────────────────────
-    exclude = set(
-        TARGET_ETF_COLS + BENCHMARK_COLS + target_etfs + benchmark_rets +
-        [f"{c}_Ret" for c in BENCHMARK_COLS] + [TBILL_COL]
-    )
+    # Merge features into df
+    for col in feat_df.columns:
+        df[col] = feat_df[col].values
 
-    # First try known macro columns
-    input_features = [c for c in MACRO_COLS if c in df.columns and c not in exclude]
-
-    # Then add any engineered signal columns
-    extra = [
-        c for c in df.columns
-        if c not in exclude
-        and c not in input_features
-        and any(k in c for k in ["_Z", "_Vol", "Regime", "YC_", "Credit_",
-                                  "Rates_", "VIX_", "Spread", "DXY", "T10Y",
-                                  "TBILL", "SOFR", "MOVE"])
-        and pd.api.types.is_numeric_dtype(df[c])
-    ]
-    input_features += extra
-
-    # Fallback: all numeric non-excluded columns
-    if not input_features:
-        input_features = [
-            c for c in df.columns
-            if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
-        ]
+    # Drop rows with NaN in features (from lags/rolling)
+    feat_cols = list(feat_df.columns)
+    df = df.dropna(subset=feat_cols).copy()
 
     # ── T-bill rate ───────────────────────────────────────────────────────────
     tbill_rate = 0.045
@@ -206,6 +229,14 @@ def get_features_and_targets(df: pd.DataFrame):
         if len(raw) > 0:
             v = float(raw.iloc[-1])
             tbill_rate = v / 100 if v > 1 else v
+
+    # Input features = all engineered feature columns
+    exclude = set(
+        TARGET_ETF_COLS + BENCHMARK_COLS + target_etfs +
+        [f"{c}_Ret" for c in BENCHMARK_COLS] + [TBILL_COL] +
+        list(MACRO_COLS)
+    )
+    input_features = [c for c in feat_cols if c not in exclude]
 
     return input_features, target_etfs, tbill_rate, df, col_info
 
