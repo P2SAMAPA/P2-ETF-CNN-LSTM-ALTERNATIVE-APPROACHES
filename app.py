@@ -32,7 +32,6 @@ from ui.components import (
     show_metrics_row, show_comparison_table, show_audit_trail,
     show_all_signals_panel,
 )
-from ui.charts import equity_curve_chart
 
 st.set_page_config(page_title="P2-ETF-CNN-LSTM", page_icon="🧠", layout="wide")
 
@@ -285,17 +284,21 @@ show_all_signals_panel(all_signals, target_etfs, False, next_date, optimal_lookb
 st.divider()
 st.subheader(f"📊 {winner_name} — Performance Metrics")
 
-# Build equity curve first to get spy_ann for metrics comparison
-fig, spy_ann = equity_curve_chart(results, winner_name, test_dates, df, test_slice, tbill_rate)
+# Compute SPY annualised return directly from raw returns for metrics comparison
+spy_ann = None
+if "SPY_Ret" in df.columns:
+    spy_raw = df["SPY_Ret"].iloc[test_slice].values.copy().astype(float)
+    spy_raw = spy_raw[~np.isnan(spy_raw)]
+    spy_raw = np.clip(spy_raw, -0.5, 0.5)
+    if len(spy_raw) > 5:
+        spy_cum = np.prod(1 + spy_raw)
+        spy_ann = float(spy_cum ** (252 / len(spy_raw)) - 1)
+
 show_metrics_row(winner_res, tbill_rate, spy_ann_return=spy_ann)
 
 st.divider()
 st.subheader("🏆 Approach Comparison (Winner = Highest Raw Annualised Return)")
 show_comparison_table(build_comparison_table(results, winner_name))
-
-st.divider()
-st.subheader(f"📈 {winner_name} vs SPY & AGG — Out-of-Sample")
-st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
 st.subheader(f"📋 Audit Trail — {winner_name} (Last 20 Trading Days)")
