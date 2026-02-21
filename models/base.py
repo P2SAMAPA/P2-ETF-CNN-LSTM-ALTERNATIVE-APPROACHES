@@ -14,6 +14,23 @@ from sklearn.utils.class_weight import compute_class_weight
 SEED      = 42
 CACHE_DIR = Path("/tmp/p2_model_cache")
 CACHE_DIR.mkdir(exist_ok=True)
+
+# Clear any v1 cache files (missing max_daily_date field)
+for _f in CACHE_DIR.glob("*.pkl"):
+    try:
+        import pickle as _pkl
+        with open(_f, "rb") as _fh:
+            _d = _pkl.load(_fh)
+        # If any result dict lacks max_daily_date, bust the whole cache
+        if isinstance(_d, dict) and "results" in _d:
+            _needs_bust = any(
+                isinstance(r, dict) and "max_daily_date" not in r
+                for r in _d["results"].values() if r is not None
+            )
+            if _needs_bust:
+                _f.unlink(missing_ok=True)
+    except Exception:
+        _f.unlink(missing_ok=True)
 np.random.seed(SEED)
 
 
