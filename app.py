@@ -13,7 +13,9 @@ from data.loader      import (load_dataset, check_data_freshness,
                                get_features_and_targets, dataset_summary)
 from utils.calendar   import get_est_time, get_next_signal_date
 from models.base      import (build_sequences, train_val_test_split,
-                               scale_features, returns_to_labels)
+                               scale_features, returns_to_labels,
+                               find_best_lookback, make_cache_key,
+                               save_cache, load_cache)
 from models.approach1_wavelet    import train_approach1, predict_approach1
 from models.approach2_regime     import train_approach2, predict_approach2
 from models.approach3_multiscale import train_approach3, predict_approach3
@@ -39,8 +41,7 @@ with st.sidebar:
 
     start_yr     = st.slider("📅 Start Year", 2010, 2024, 2016)
     fee_bps      = st.slider("💰 Fee (bps)", 0, 50, 10)
-    lookback     = st.slider("📐 Lookback (days)", 20, 60, 30, step=5)
-    epochs       = st.number_input("🔁 Max Epochs", 20, 300, 100, step=10)
+    epochs       = st.number_input("🔁 Max Epochs", 20, 150, 80, step=10)
 
     st.divider()
     split_option = st.selectbox("📊 Train/Val/Test Split", ["70/15/15", "80/10/10"], index=0)
@@ -109,7 +110,7 @@ st.info(
     f"**T-bill:** {tbill_rate*100:.2f}%"
 )
 
-# ── Build sequences ───────────────────────────────────────────────────────────
+# ── Prepare raw arrays ────────────────────────────────────────────────────────
 X_raw = df[input_features].values.astype(np.float32)
 y_raw = df[target_etfs].values.astype(np.float32)
 
@@ -117,39 +118,74 @@ for j in range(X_raw.shape[1]):
     mask = np.isnan(X_raw[:, j])
     if mask.any():
         X_raw[mask, j] = np.nanmean(X_raw[:, j])
-
 for j in range(y_raw.shape[1]):
     mask = np.isnan(y_raw[:, j])
     if mask.any():
         y_raw[mask, j] = np.nanmean(y_raw[:, j])
 
-X_seq, y_seq = build_sequences(X_raw, y_raw, lookback)
-y_labels     = returns_to_labels(y_seq, include_cash=include_cash)
+# ── Auto-select optimal lookback ──────────────────────────────────────────────
+last_date_str = str(freshness.get("last_date_in_data", "unknown"))
 
-(X_train, y_train_r, X_val, y_val_r,
- X_test,  y_test_r)  = train_val_test_split(X_seq, y_seq,    train_pct, val_pct)
-(_,       y_train_l,  _,    y_val_l,
- _,       _)         = train_val_test_split(X_seq, y_labels, train_pct, val_pct)
+# Check cache for lookback selection too
+lb_cache_key = make_cache_key(
+    last_date_str, start_yr, fee_bps, int(epochs), split_option, include_cash, 0
+)
+lb_cached = load_cache(f"lb_{lb_cache_key}")
 
-X_train_s, X_val_s, X_test_s, _ = scale_features(X_train, X_val, X_test)
+if lb_cached is not None:
+    optimal_lookback = lb_cached["optimal_lookback"]
+    st.success(f"⚡ Loaded from cache · Optimal lookback: **{optimal_lookback}d**")
+else:
+    with st.spinner("🔍 Finding optimal lookback (30 / 45 / 60d)..."):
+        def _y_labels_fn(y_seq):
+            return returns_to_labels(y_seq, include_cash=include_cash)
+        optimal_lookback = find_best_lookback(
+            X_raw, y_raw, _y_labels_fn,
+            train_pct, val_pct, n_classes, include_cash,
+            candidates=[30, 45, 60],
+        )
+    save_cache(f"lb_{lb_cache_key}", {"optimal_lookback": optimal_lookback})
+    st.success(f"📐 Optimal lookback: **{optimal_lookback}d** (auto-selected from 30/45/60)")
 
-train_size = len(X_train)
-val_size   = len(X_val)
-test_start = lookback + train_size + val_size
-test_dates = df.index[test_start: test_start + len(X_test)]
-test_slice = slice(test_start, test_start + len(X_test))
+lookback = optimal_lookback
 
-st.success(f"✅ Sequences — Train: {train_size:,} · Val: {val_size:,} · Test: {len(X_test):,}")
+# ── Check full model cache ────────────────────────────────────────────────────
+cache_key    = make_cache_key(last_date_str, start_yr, fee_bps, int(epochs),
+                               split_option, include_cash, lookback)
+cached_data  = load_cache(cache_key)
+from_cache   = cached_data is not None
 
-# ── Train all three approaches ────────────────────────────────────────────────
-results      = {}
-trained_info = {}
-progress     = st.progress(0, text="Starting training...")
+if from_cache:
+    results      = cached_data["results"]
+    trained_info = cached_data["trained_info"]
+    test_dates   = pd.DatetimeIndex(cached_data["test_dates"])
+    test_slice   = cached_data["test_slice"]
+    st.success("⚡ Results loaded from cache — no retraining needed.")
+else:
+    # ── Build sequences ───────────────────────────────────────────────────────
+    X_seq, y_seq = build_sequences(X_raw, y_raw, lookback)
+    y_labels     = returns_to_labels(y_seq, include_cash=include_cash)
 
-# Approach 1
-with st.spinner("🌊 Training Approach 1 — Wavelet CNN-LSTM..."):
+    (X_train, y_train_r, X_val, y_val_r,
+     X_test,  y_test_r)  = train_val_test_split(X_seq, y_seq,    train_pct, val_pct)
+    (_,       y_train_l,  _,    y_val_l,
+     _,       _)         = train_val_test_split(X_seq, y_labels, train_pct, val_pct)
+
+    X_train_s, X_val_s, X_test_s, _ = scale_features(X_train, X_val, X_test)
+
+    train_size = len(X_train)
+    val_size   = len(X_val)
+    test_start = lookback + train_size + val_size
+    test_dates = df.index[test_start: test_start + len(X_test)]
+    test_slice = slice(test_start, test_start + len(X_test))
+
+    results      = {}
+    trained_info = {}
+    progress     = st.progress(0, text="Training Approach 1...")
+
+    # ── Approach 1 ────────────────────────────────────────────────────────────
     try:
-        model1, hist1, _ = train_approach1(
+        model1, _, _ = train_approach1(
             X_train_s, y_train_l, X_val_s, y_val_l,
             n_classes=n_classes, epochs=int(epochs),
         )
@@ -159,17 +195,15 @@ with st.spinner("🌊 Training Approach 1 — Wavelet CNN-LSTM..."):
             target_etfs, fee_bps, tbill_rate, include_cash,
         )
         trained_info["Approach 1"] = {"proba": proba1}
-        st.success("✅ Approach 1 complete")
     except Exception as e:
         st.warning(f"⚠️ Approach 1 failed: {e}")
         results["Approach 1"] = None
 
-progress.progress(33, text="Approach 1 done...")
+    progress.progress(33, text="Training Approach 2...")
 
-# Approach 2
-with st.spinner("🔀 Training Approach 2 — Regime-Conditioned CNN-LSTM..."):
+    # ── Approach 2 ────────────────────────────────────────────────────────────
     try:
-        model2, hist2, hmm2, regime_cols2 = train_approach2(
+        model2, _, hmm2, regime_cols2 = train_approach2(
             X_train_s, y_train_l, X_val_s, y_val_l,
             X_flat_all=X_raw, feature_names=input_features,
             lookback=lookback, train_size=train_size, val_size=val_size,
@@ -184,17 +218,15 @@ with st.spinner("🔀 Training Approach 2 — Regime-Conditioned CNN-LSTM..."):
             target_etfs, fee_bps, tbill_rate, include_cash,
         )
         trained_info["Approach 2"] = {"proba": proba2}
-        st.success("✅ Approach 2 complete")
     except Exception as e:
         st.warning(f"⚠️ Approach 2 failed: {e}")
         results["Approach 2"] = None
 
-progress.progress(66, text="Approach 2 done...")
+    progress.progress(66, text="Training Approach 3...")
 
-# Approach 3
-with st.spinner("📡 Training Approach 3 — Multi-Scale CNN-LSTM..."):
+    # ── Approach 3 ────────────────────────────────────────────────────────────
     try:
-        model3, hist3 = train_approach3(
+        model3, _ = train_approach3(
             X_train_s, y_train_l, X_val_s, y_val_l,
             n_classes=n_classes, epochs=int(epochs),
         )
@@ -204,13 +236,20 @@ with st.spinner("📡 Training Approach 3 — Multi-Scale CNN-LSTM..."):
             target_etfs, fee_bps, tbill_rate, include_cash,
         )
         trained_info["Approach 3"] = {"proba": proba3}
-        st.success("✅ Approach 3 complete")
     except Exception as e:
         st.warning(f"⚠️ Approach 3 failed: {e}")
         results["Approach 3"] = None
 
-progress.progress(100, text="All approaches complete!")
-progress.empty()
+    progress.progress(100, text="Done!")
+    progress.empty()
+
+    # ── Save to cache ─────────────────────────────────────────────────────────
+    save_cache(cache_key, {
+        "results":      results,
+        "trained_info": trained_info,
+        "test_dates":   list(test_dates),
+        "test_slice":   test_slice,
+    })
 
 # ── Select winner ─────────────────────────────────────────────────────────────
 winner_name = select_winner(results)
@@ -226,14 +265,14 @@ st.divider()
 # ── Winner signal banner ──────────────────────────────────────────────────────
 show_signal_banner(winner_res["next_signal"], next_date, winner_name)
 
-# ── Conviction panel (winner only) ────────────────────────────────────────────
+# ── Conviction panel ──────────────────────────────────────────────────────────
 winner_proba = trained_info[winner_name]["proba"]
 conviction   = compute_conviction(winner_proba[-1], target_etfs, include_cash)
 show_conviction_panel(conviction)
 
 st.divider()
 
-# ── All models' next day signals ──────────────────────────────────────────────
+# ── All models next day signals ───────────────────────────────────────────────
 all_signals = {
     name: {
         "signal":    res["next_signal"],
@@ -242,7 +281,7 @@ all_signals = {
     }
     for name, res in results.items() if res is not None
 }
-show_all_signals_panel(all_signals, target_etfs, include_cash, next_date)
+show_all_signals_panel(all_signals, target_etfs, include_cash, next_date, optimal_lookback)
 
 st.divider()
 
@@ -259,13 +298,13 @@ show_comparison_table(comparison_df)
 
 st.divider()
 
-# ── Equity curves ─────────────────────────────────────────────────────────────
-st.subheader("📈 Out-of-Sample Equity Curves — All Approaches vs Benchmarks")
+# ── Equity curve ──────────────────────────────────────────────────────────────
+st.subheader(f"📈 {winner_name} vs SPY & AGG — Out-of-Sample")
 fig = equity_curve_chart(results, winner_name, test_dates, df, test_slice, tbill_rate)
 st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
 
-# ── Audit trail (winner) ──────────────────────────────────────────────────────
+# ── Audit trail ───────────────────────────────────────────────────────────────
 st.subheader(f"📋 Audit Trail — {winner_name} (Last 20 Trading Days)")
 show_audit_trail(winner_res["audit_trail"])
