@@ -173,10 +173,10 @@ def show_metrics_row(result: dict, tbill_rate: float, spy_ann_return: float = No
     c4.metric("📉 Max Drawdown", f"{result['max_dd']*100:.2f}%",
               delta="Peak to Trough")
 
-    # Max daily DD with date
+    # Max daily DD with date (only show date if available)
     worst_date = result.get("max_daily_date", "N/A")
-    c5.metric("⚠️ Max Daily DD", f"{result['max_daily_dd']*100:.2f}%",
-              delta=f"on {worst_date}")
+    dd_delta   = f"on {worst_date}" if worst_date != "N/A" else "Worst Single Day"
+    c5.metric("⚠️ Max Daily DD", f"{result['max_daily_dd']*100:.2f}%", delta=dd_delta)
 
 
 # ── Comparison table ──────────────────────────────────────────────────────────
