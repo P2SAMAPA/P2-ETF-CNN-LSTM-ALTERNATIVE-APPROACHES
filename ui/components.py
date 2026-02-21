@@ -76,6 +76,25 @@ def show_all_signals_panel(all_signals: dict, target_etfs: list,
         """, unsafe_allow_html=True)
 
 
+def _build_etf_badges(sorted_pairs: list, best_name: str, color: str) -> str:
+    """Build compact ETF probability badges as HTML string."""
+    badges = []
+    for name, score in sorted_pairs:
+        is_best = name == best_name
+        bg      = "#e8fdf7" if is_best else "#f8f8f8"
+        border  = color if is_best else "#ddd"
+        txt_col = color if is_best else "#555"
+        weight  = "700" if is_best else "400"
+        star    = "★ " if is_best else ""
+        badges.append(
+            f'<span style="background:{bg}; border:1px solid {border}; '
+            f'border-radius:6px; padding:4px 10px; font-size:13px; '
+            f'color:{txt_col}; font-weight:{weight};">'
+            f'{star}{name} {score:.3f}</span>'
+        )
+    return "".join(badges)
+
+
 # ── Signal conviction panel ───────────────────────────────────────────────────
 
 def show_conviction_panel(conviction: dict):
@@ -121,14 +140,7 @@ def show_conviction_panel(conviction: dict):
         MODEL PROBABILITY BY ETF
       </div>
       <div style="display:flex; flex-wrap:wrap; gap:8px;">
-        {"".join([
-            f'<span style="background:{"#e8fdf7" if n == best_name else "#f8f8f8"}; '
-            f'border:1px solid {"' + color + '" if n == best_name else "#ddd"}; '
-            f'border-radius:6px; padding:4px 10px; font-size:13px; '
-            f'color:{"' + color + '" if n == best_name else "#555"}; font-weight:{"700" if n == best_name else "400"};">'
-            f'{"★ " if n == best_name else ""}{n} {s:.3f}</span>'
-            for n, s in sorted_pairs
-        ])}
+        {_build_etf_badges(sorted_pairs, best_name, color)}
       </div>
     </div>
     """, unsafe_allow_html=True)
