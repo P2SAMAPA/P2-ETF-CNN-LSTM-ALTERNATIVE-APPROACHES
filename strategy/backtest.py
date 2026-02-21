@@ -55,6 +55,8 @@ def execute_strategy(
             cls          = min(cls, n_etfs - 1)
             signal_etf   = target_etfs[cls].replace("_Ret", "")
             realized_ret = float(y_raw_test[i][cls])
+            # Sanity clip: daily returns should never exceed ±50%
+            realized_ret = max(-0.50, min(0.50, realized_ret))
 
         net_ret = realized_ret - (fee_bps / 10000)
         strat_rets.append(net_ret)
