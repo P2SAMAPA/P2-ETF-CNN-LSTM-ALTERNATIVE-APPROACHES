@@ -148,8 +148,7 @@ if run_button:
         with st.spinner("🔍 Auto-selecting optimal lookback (30 / 45 / 60d)..."):
             optimal_lookback = find_best_lookback(
                 X_raw, y_raw,
-                lambda y: returns_to_labels(y, include_cash=False),
-                train_pct, val_pct, n_classes, False,
+                train_pct, val_pct, n_classes,
                 candidates=[30, 45, 60],
             )
         save_cache(f"lb_{lb_key}", {"optimal_lookback": optimal_lookback})
