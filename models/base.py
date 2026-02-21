@@ -122,7 +122,7 @@ def classification_head(x, n_classes, dropout=0.3):
 # ── Auto lookback selection (Approach 1 proxy, fast) ─────────────────────────
 
 def find_best_lookback(X_raw, y_raw, train_pct, val_pct, n_classes,
-                        candidates=None):
+                        include_cash=False, candidates=None):
     from tensorflow import keras
 
     if candidates is None:
