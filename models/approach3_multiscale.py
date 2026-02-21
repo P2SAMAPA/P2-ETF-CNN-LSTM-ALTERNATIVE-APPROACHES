@@ -1,18 +1,21 @@
 """
 models/approach3_multiscale.py
 Approach 3: Multi-Scale Parallel CNN-LSTM
-With class weights to prevent majority-class collapse.
+- CPU-optimised smaller architecture
+- Class weights to prevent majority-class collapse
+- Lazy imports to prevent module-level failures
 """
 
 import numpy as np
 
 KERNEL_SIZES = [3, 7, 21]
-FILTERS_EACH = 32
+FILTERS_EACH = 16    # reduced from 32 for CPU speed
 
 
 def build_multiscale_cnn_lstm(
-    input_shape, n_classes, kernel_sizes=None,
-    filters=FILTERS_EACH, dropout=0.3, lstm_units=128,
+    input_shape, n_classes,
+    kernel_sizes=None, filters=FILTERS_EACH,
+    dropout=0.3, lstm_units=64,
 ):
     from tensorflow import keras
     from models.base import classification_head
@@ -22,19 +25,15 @@ def build_multiscale_cnn_lstm(
 
     inputs  = keras.Input(shape=input_shape, name="multiscale_input")
     towers  = []
-
     for k in kernel_sizes:
         t = keras.layers.Conv1D(filters, k, padding="causal", activation="relu",
                                 name=f"conv1_k{k}")(inputs)
         t = keras.layers.BatchNormalization(name=f"bn1_k{k}")(t)
-        t = keras.layers.Conv1D(filters, k, padding="causal", activation="relu",
-                                name=f"conv2_k{k}")(t)
-        t = keras.layers.BatchNormalization(name=f"bn2_k{k}")(t)
         t = keras.layers.Dropout(dropout, name=f"drop_k{k}")(t)
         towers.append(t)
 
-    merged = keras.layers.Concatenate(axis=-1)(towers) if len(towers) > 1 else towers[0]
-    x      = keras.layers.LSTM(lstm_units, dropout=dropout, recurrent_dropout=0.1)(merged)
+    merged  = keras.layers.Concatenate(axis=-1)(towers) if len(towers) > 1 else towers[0]
+    x       = keras.layers.LSTM(lstm_units, dropout=dropout)(merged)
     outputs = classification_head(x, n_classes, dropout)
 
     model = keras.Model(inputs, outputs, name="Approach3_MultiScale")
@@ -48,8 +47,8 @@ def build_multiscale_cnn_lstm(
 
 def train_approach3(
     X_train, y_train, X_val, y_val,
-    n_classes, epochs=100, batch_size=32,
-    dropout=0.3, lstm_units=128, kernel_sizes=None,
+    n_classes, epochs=80, batch_size=64,
+    dropout=0.3, lstm_units=64, kernel_sizes=None,
 ):
     from models.base import get_callbacks, compute_class_weights
 
@@ -59,7 +58,8 @@ def train_approach3(
     lookback      = X_train.shape[1]
     valid_kernels = [k for k in kernel_sizes if k <= lookback] or [min(3, lookback)]
     model         = build_multiscale_cnn_lstm(
-        X_train.shape[1:], n_classes, valid_kernels, dropout=dropout, lstm_units=lstm_units,
+        X_train.shape[1:], n_classes, valid_kernels,
+        dropout=dropout, lstm_units=lstm_units,
     )
     cw = compute_class_weights(y_train, n_classes)
 
