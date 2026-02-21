@@ -1,200 +1,171 @@
 """
-models/base.py
-Shared utilities for all CNN-LSTM variants.
-Optimised for CPU training on HF Spaces.
+strategy/backtest.py
+Strategy execution, performance metrics, and benchmark calculations.
+
+CASH logic (drawdown risk overlay — not a model class):
+  ENTER : 2-day cumulative return <= -15%
+  EXIT  : model conviction Z-score >= 1.0 (model decisively picks an ETF again)
 """
 
 import numpy as np
-import hashlib
-import pickle
-import os
-from pathlib import Path
-from sklearn.preprocessing import RobustScaler
-from sklearn.utils.class_weight import compute_class_weight
+import pandas as pd
+from datetime import datetime
 
-SEED     = 42
-CACHE_DIR = Path("/tmp/p2_model_cache")
-CACHE_DIR.mkdir(exist_ok=True)
-
-np.random.seed(SEED)
+CASH_DRAWDOWN_TRIGGER = -0.15   # 2-day cumulative return threshold
+CASH_EXIT_Z           =  1.0   # Z-score required to exit CASH
 
 
-# ── Cache helpers ─────────────────────────────────────────────────────────────
-
-def make_cache_key(last_date: str, start_yr: int, fee_bps: int,
-                   epochs: int, split: str, include_cash: bool,
-                   lookback: int) -> str:
-    raw = f"{last_date}_{start_yr}_{fee_bps}_{epochs}_{split}_{include_cash}_{lookback}"
-    return hashlib.md5(raw.encode()).hexdigest()
+def _zscore(proba: np.ndarray) -> float:
+    std = np.std(proba)
+    return float((np.max(proba) - np.mean(proba)) / std) if std > 1e-9 else 0.0
 
 
-def save_cache(key: str, payload: dict):
-    path = CACHE_DIR / f"{key}.pkl"
-    with open(path, "wb") as f:
-        pickle.dump(payload, f)
+def execute_strategy(
+    preds: np.ndarray,
+    proba: np.ndarray,
+    y_raw_test: np.ndarray,
+    test_dates: pd.DatetimeIndex,
+    target_etfs: list,
+    fee_bps: int,
+    tbill_rate: float,
+    include_cash: bool = True,   # kept for API compat but CASH is now overlay-only
+) -> dict:
+    n_etfs      = len(target_etfs)
+    daily_tbill = tbill_rate / 252
+    fee         = fee_bps / 10000
+    today       = datetime.now().date()
+
+    strat_rets  = []
+    audit_trail = []
+    date_index  = []
+
+    in_cash       = False
+    recent_rets   = []   # rolling 2-day window
+
+    for i, cls in enumerate(preds):
+        cls      = min(int(cls), n_etfs - 1)
+        etf_name = target_etfs[cls].replace("_Ret", "")
+        etf_ret  = float(np.clip(y_raw_test[i][cls], -0.5, 0.5))
+        z        = _zscore(proba[i])
+
+        # ── 2-day drawdown check ──────────────────────────────────────────────
+        recent_rets.append(etf_ret)
+        if len(recent_rets) > 2:
+            recent_rets.pop(0)
+        two_day = ((1 + recent_rets[0]) * (1 + recent_rets[-1]) - 1
+                   if len(recent_rets) >= 2 else 0.0)
+
+        if two_day <= CASH_DRAWDOWN_TRIGGER:
+            in_cash = True
+        if in_cash and z >= CASH_EXIT_Z:
+            in_cash = False
+
+        # ── Execute ───────────────────────────────────────────────────────────
+        if in_cash:
+            signal_etf   = "CASH"
+            realized_ret = daily_tbill
+        else:
+            signal_etf   = etf_name
+            realized_ret = etf_ret
+
+        net_ret = realized_ret - fee
+        strat_rets.append(net_ret)
+        date_index.append(test_dates[i])
+
+        if test_dates[i].date() < today:
+            audit_trail.append({
+                "Date":       test_dates[i].strftime("%Y-%m-%d"),
+                "Signal":     signal_etf,
+                "Net_Return": net_ret,
+                "Z_Score":    round(z, 2),
+            })
+
+    strat_rets = np.array(strat_rets, dtype=np.float64)
+
+    # Next signal
+    last_cls  = min(int(preds[-1]), n_etfs - 1)
+    last_z    = _zscore(proba[-1])
+    last_ret  = float(np.clip(y_raw_test[-1][last_cls], -0.5, 0.5))
+    prev_ret  = float(np.clip(y_raw_test[-2][last_cls], -0.5, 0.5)) if len(y_raw_test) > 1 else 0.0
+    last_2d   = (1 + prev_ret) * (1 + last_ret) - 1
+    next_cash = last_2d <= CASH_DRAWDOWN_TRIGGER and last_z < CASH_EXIT_Z
+    next_signal = "CASH" if next_cash else target_etfs[last_cls].replace("_Ret", "")
+
+    metrics = _compute_metrics(strat_rets, tbill_rate, date_index)
+
+    return {
+        **metrics,
+        "strat_rets":  strat_rets,
+        "audit_trail": audit_trail,
+        "next_signal": next_signal,
+        "next_proba":  proba[-1],
+    }
 
 
-def load_cache(key: str) -> dict | None:
-    path = CACHE_DIR / f"{key}.pkl"
-    if path.exists():
-        try:
-            with open(path, "rb") as f:
-                return pickle.load(f)
-        except Exception:
-            path.unlink(missing_ok=True)
-    return None
+def _compute_metrics(strat_rets: np.ndarray, tbill_rate: float,
+                     date_index: list = None) -> dict:
+    if len(strat_rets) == 0:
+        return {}
+
+    cum_returns = np.cumprod(1 + strat_rets)
+    n           = len(strat_rets)
+    ann_return  = float(cum_returns[-1] ** (252 / n) - 1)
+
+    excess = strat_rets - tbill_rate / 252
+    sharpe = float(np.mean(excess) / (np.std(strat_rets) + 1e-9) * np.sqrt(252))
+
+    hit_ratio = float(np.mean(strat_rets[-15:] > 0))
+
+    cum_max  = np.maximum.accumulate(cum_returns)
+    drawdown = (cum_returns - cum_max) / cum_max
+    max_dd   = float(np.min(drawdown))
+
+    worst_idx  = int(np.argmin(strat_rets))
+    max_daily  = float(strat_rets[worst_idx])
+    worst_date = (date_index[worst_idx].strftime("%Y-%m-%d")
+                  if date_index and worst_idx < len(date_index) else "N/A")
+
+    return {
+        "cum_returns":    cum_returns,
+        "ann_return":     ann_return,
+        "sharpe":         sharpe,
+        "hit_ratio":      hit_ratio,
+        "max_dd":         max_dd,
+        "max_daily_dd":   max_daily,
+        "max_daily_date": worst_date,
+        "cum_max":        cum_max,
+    }
 
 
-# ── Sequence builder ──────────────────────────────────────────────────────────
-
-def build_sequences(features: np.ndarray, targets: np.ndarray, lookback: int):
-    X, y = [], []
-    for i in range(lookback, len(features)):
-        X.append(features[i - lookback: i])
-        y.append(targets[i])
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+def compute_benchmark_metrics(returns: np.ndarray, tbill_rate: float) -> dict:
+    return _compute_metrics(np.array(returns, dtype=np.float64), tbill_rate)
 
 
-# ── Train / val / test split ──────────────────────────────────────────────────
-
-def train_val_test_split(X, y, train_pct=0.70, val_pct=0.15):
-    n  = len(X)
-    t1 = int(n * train_pct)
-    t2 = int(n * (train_pct + val_pct))
-    return X[:t1], y[:t1], X[t1:t2], y[t1:t2], X[t2:], y[t2:]
-
-
-# ── Feature scaling ───────────────────────────────────────────────────────────
-
-def scale_features(X_train, X_val, X_test):
-    n_feat = X_train.shape[2]
-    scaler = RobustScaler()
-    scaler.fit(X_train.reshape(-1, n_feat))
-    def _t(X):
-        s = X.shape
-        return scaler.transform(X.reshape(-1, n_feat)).reshape(s)
-    return _t(X_train), _t(X_val), _t(X_test), scaler
-
-
-# ── Label builder ─────────────────────────────────────────────────────────────
-
-def returns_to_labels(y_raw, include_cash=True, cash_threshold=0.0):
-    best = np.argmax(y_raw, axis=1)
-    if include_cash:
-        best_ret = y_raw[np.arange(len(y_raw)), best]
-        cash_idx = y_raw.shape[1]
-        labels   = np.where(best_ret < cash_threshold, cash_idx, best)
-    else:
-        labels = best
-    return labels.astype(np.int32)
-
-
-# ── Class weights ─────────────────────────────────────────────────────────────
-
-def compute_class_weights(y_labels: np.ndarray, n_classes: int) -> dict:
-    present = np.unique(y_labels)
-    try:
-        weights = compute_class_weight("balanced", classes=present, y=y_labels)
-        weight_dict = {int(c): float(w) for c, w in zip(present, weights)}
-    except Exception:
-        weight_dict = {}
-    for c in range(n_classes):
-        if c not in weight_dict:
-            weight_dict[c] = 1.0
-    return weight_dict
-
-
-# ── Callbacks ─────────────────────────────────────────────────────────────────
-
-def get_callbacks(patience_es=15, patience_lr=8, min_lr=1e-6):
-    from tensorflow import keras
-    return [
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            patience=patience_es,
-            restore_best_weights=True,
-            verbose=0,
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
-            factor=0.5,
-            patience=patience_lr,
-            min_lr=min_lr,
-            verbose=0,
-        ),
-    ]
-
-
-# ── Lightweight output head (CPU-optimised) ───────────────────────────────────
-
-def classification_head(x, n_classes: int, dropout: float = 0.3):
-    """Smaller head than original — faster on CPU, less overfitting risk."""
-    from tensorflow import keras
-    x = keras.layers.Dense(32, activation="relu")(x)
-    x = keras.layers.Dropout(dropout)(x)
-    x = keras.layers.Dense(n_classes, activation="softmax")(x)
-    return x
-
-
-# ── Auto lookback selection ───────────────────────────────────────────────────
-
-def find_best_lookback(
-    X_raw: np.ndarray,
-    y_raw: np.ndarray,
-    y_labels_fn,
-    train_pct: float,
-    val_pct: float,
-    n_classes: int,
-    include_cash: bool,
-    candidates: list = None,
-):
-    """
-    Train a fast lightweight CNN on each lookback candidate using val loss.
-    Returns best lookback int.
-    Uses only Approach 1 architecture (fastest) to pick the winner.
-    """
-    from tensorflow import keras
-
-    if candidates is None:
-        candidates = [30, 45, 60]
-
-    best_lb   = candidates[0]
-    best_loss = np.inf
-
-    for lb in candidates:
-        try:
-            X_seq, y_seq = build_sequences(X_raw, y_raw, lb)
-            y_lab        = y_labels_fn(y_seq)
-
-            X_tr, y_tr, X_v, y_v, _, _ = train_val_test_split(X_seq, y_lab, train_pct, val_pct)
-            X_tr_s, X_v_s, _, _        = scale_features(X_tr, X_v, X_v)
-
-            cw = compute_class_weights(y_tr, n_classes)
-
-            # Tiny fast model just for lookback selection
-            inp = keras.Input(shape=X_tr_s.shape[1:])
-            x   = keras.layers.Conv1D(16, min(3, lb), padding="causal", activation="relu")(inp)
-            x   = keras.layers.GlobalAveragePooling1D()(x)
-            out = keras.layers.Dense(n_classes, activation="softmax")(x)
-            m   = keras.Model(inp, out)
-            m.compile(optimizer="adam", loss="sparse_categorical_crossentropy")
-
-            hist = m.fit(
-                X_tr_s, y_tr,
-                validation_data=(X_v_s, y_v),
-                epochs=15,
-                batch_size=64,
-                class_weight=cw,
-                callbacks=[keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)],
-                verbose=0,
-            )
-            val_loss = min(hist.history.get("val_loss", [np.inf]))
-            if val_loss < best_loss:
-                best_loss = val_loss
-                best_lb   = lb
-
-            del m
-        except Exception:
+def select_winner(results: dict) -> str:
+    best_name, best_ret = None, -np.inf
+    for name, res in results.items():
+        if res is None:
             continue
+        r = res.get("ann_return", -np.inf)
+        if r > best_ret:
+            best_ret, best_name = r, name
+    return best_name
 
-    return best_lb
+
+def build_comparison_table(results: dict, winner_name: str) -> pd.DataFrame:
+    rows = []
+    for name, res in results.items():
+        if res is None:
+            rows.append({"Approach": name, "Ann. Return": "N/A",
+                         "Sharpe": "N/A", "Hit Ratio (15d)": "N/A",
+                         "Max Drawdown": "N/A", "Winner": ""})
+            continue
+        rows.append({
+            "Approach":        name,
+            "Ann. Return":     f"{res['ann_return']*100:.2f}%",
+            "Sharpe":          f"{res['sharpe']:.2f}",
+            "Hit Ratio (15d)": f"{res['hit_ratio']*100:.0f}%",
+            "Max Drawdown":    f"{res['max_dd']*100:.2f}%",
+            "Winner":          "⭐ WINNER" if name == winner_name else "",
+        })
+    return pd.DataFrame(rows)
