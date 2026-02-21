@@ -227,3 +227,46 @@ def show_audit_trail(audit_trail: list):
         {"selector": "td", "props": [("padding", "10px")]},
     ])
     st.dataframe(styled, use_container_width=True, height=500)
+
+
+# ── All models' next day signals panel ───────────────────────────────────────
+
+def show_all_signals_panel(all_signals: dict, target_etfs: list, include_cash: bool, next_date):
+    """
+    Compact panel showing what each model predicts for next trading day,
+    with top probability displayed.
+    """
+    APPROACH_COLORS = {
+        "Approach 1": "#00ffc8",
+        "Approach 2": "#7c6aff",
+        "Approach 3": "#ff6b6b",
+    }
+
+    st.subheader(f"🗓️ All Models — {next_date.strftime('%Y-%m-%d')} Signals")
+
+    cols = st.columns(len(all_signals))
+    for col, (name, info) in zip(cols, all_signals.items()):
+        color     = APPROACH_COLORS.get(name, "#888888")
+        signal    = info["signal"]
+        proba     = info["proba"]
+        top_prob  = float(np.max(proba)) * 100
+        is_winner = info["is_winner"]
+        border    = f"3px solid {color}"
+        badge     = " ⭐ WINNER" if is_winner else ""
+
+        col.markdown(f"""
+        <div style="border:{border}; border-radius:12px; padding:18px 16px;
+                    background:#111118; text-align:center;">
+            <div style="color:{color}; font-size:11px; font-weight:700;
+                        letter-spacing:2px; margin-bottom:6px;">
+                {name.upper()}{badge}
+            </div>
+            <div style="color:white; font-size:28px; font-weight:800;
+                        margin:8px 0;">
+                {signal}
+            </div>
+            <div style="color:#aaa; font-size:12px;">
+                Top prob: <span style="color:{color}; font-weight:700;">{top_prob:.1f}%</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
