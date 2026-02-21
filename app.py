@@ -169,7 +169,7 @@ if run_button:
         st.success("⚡ Results loaded from cache — no retraining needed.")
     else:
         X_seq, y_seq = build_sequences(X_raw, y_raw, lookback)
-        y_labels     = returns_to_labels(y_seq, include_cash=False)
+        y_labels     = returns_to_labels(y_seq)
 
         (X_train, y_train_r, X_val, y_val_r,
          X_test,  y_test_r)  = train_val_test_split(X_seq, y_seq,    train_pct, val_pct)
