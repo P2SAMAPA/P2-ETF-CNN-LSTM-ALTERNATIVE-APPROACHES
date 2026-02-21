@@ -20,7 +20,7 @@ np.random.seed(SEED)
 # ── Cache helpers ─────────────────────────────────────────────────────────────
 
 def make_cache_key(last_date, start_yr, fee_bps, epochs, split, include_cash, lookback):
-    raw = f"{last_date}_{start_yr}_{fee_bps}_{epochs}_{split}_{include_cash}_{lookback}"
+    raw = f"v2_{last_date}_{start_yr}_{fee_bps}_{epochs}_{split}_{include_cash}_{lookback}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
