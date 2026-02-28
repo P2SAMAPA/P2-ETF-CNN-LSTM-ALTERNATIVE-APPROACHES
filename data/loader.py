@@ -4,14 +4,12 @@ Loads master_data.parquet from HF Dataset.
 Engineers rich feature set from raw price/macro columns.
 No external pings — all data from HF Dataset only.
 """
-
 import pandas as pd
 import numpy as np
 import streamlit as st
 from huggingface_hub import hf_hub_download
 from datetime import datetime, timedelta
 import pytz
-
 try:
     import pandas_market_calendars as mcal
     NYSE_CAL_AVAILABLE = True
@@ -20,14 +18,12 @@ except ImportError:
 
 DATASET_REPO    = "P2SAMAPA/fi-etf-macro-signal-master-data"
 PARQUET_FILE    = "master_data.parquet"
-TARGET_ETF_COLS = ["TLT", "TBT", "VNQ", "SLV", "GLD"]
+TARGET_ETF_COLS = ["TLT", "VNQ", "SLV", "GLD", "LQD", "HYG", "VCIT"]
 BENCHMARK_COLS  = ["SPY", "AGG"]
 TBILL_COL       = "TBILL_3M"
 MACRO_COLS      = ["VIX", "DXY", "T10Y2Y", "IG_SPREAD", "HY_SPREAD"]
 
-
 # ── NYSE calendar ─────────────────────────────────────────────────────────────
-
 def get_last_nyse_trading_day(as_of=None):
     est = pytz.timezone("US/Eastern")
     if as_of is None:
@@ -46,9 +42,7 @@ def get_last_nyse_trading_day(as_of=None):
         candidate -= timedelta(days=1)
     return candidate
 
-
 # ── Data loading ──────────────────────────────────────────────────────────────
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_dataset(hf_token: str) -> pd.DataFrame:
     try:
@@ -64,15 +58,13 @@ def load_dataset(hf_token: str) -> pd.DataFrame:
                 if col in df.columns:
                     df = df.set_index(col)
                     break
-            df.index = pd.to_datetime(df.index)
+        df.index = pd.to_datetime(df.index)
         return df.sort_index()
     except Exception as e:
         st.error(f"❌ Failed to load dataset: {e}")
         return pd.DataFrame()
 
-
 # ── Freshness check ───────────────────────────────────────────────────────────
-
 def check_data_freshness(df: pd.DataFrame) -> dict:
     if df.empty:
         return {"fresh": False, "message": "Dataset is empty."}
@@ -80,16 +72,14 @@ def check_data_freshness(df: pd.DataFrame) -> dict:
     expect = get_last_nyse_trading_day()
     fresh  = last >= expect
     msg = (
-        f"✅ Dataset up to date through **{last}**." if fresh else
-        f"⚠️ **{expect}** data not yet updated. Latest: **{last}**. "
+        f"✅ Dataset up to date through {last}." if fresh else
+        f"⚠️ {expect} data not yet updated. Latest: {last}. "
         f"Dataset updates daily after market close."
     )
     return {"fresh": fresh, "last_date_in_data": last,
             "expected_date": expect, "message": msg}
 
-
 # ── Price → returns ───────────────────────────────────────────────────────────
-
 def _to_returns(series: pd.Series) -> pd.Series:
     """Convert price series to daily pct returns. If already returns, pass through."""
     clean = series.dropna()
@@ -99,13 +89,10 @@ def _to_returns(series: pd.Series) -> pd.Series:
         return series.pct_change()
     return series                         # already returns
 
-
 # ── Feature engineering ───────────────────────────────────────────────────────
-
 def _engineer_features(df: pd.DataFrame, ret_cols: list) -> pd.DataFrame:
     """
     Build a rich feature set from raw macro + ETF return columns.
-
     Features added per ETF return:
       - 1d, 5d, 21d lagged returns
       - 5d, 21d rolling volatility
@@ -120,7 +107,7 @@ def _engineer_features(df: pd.DataFrame, ret_cols: list) -> pd.DataFrame:
       - TBILL_3M as a feature (rate level)
       - VIX regime flag (VIX > 25)
       - Yield curve slope (already T10Y2Y)
-      - Cross-asset momentum: spread between TLT_ret and TBT_ret
+      - Cross-asset momentum: spread between TLT_ret and AGG_ret
     """
     feat = pd.DataFrame(index=df.index)
 
@@ -154,9 +141,9 @@ def _engineer_features(df: pd.DataFrame, ret_cols: list) -> pd.DataFrame:
         feat["TBILL_chg5"]  = tbill.diff(5)
 
     # ── Derived cross-asset signals ───────────────────────────────────────────
-    if "TLT_Ret" in df.columns and "TBT_Ret" in df.columns:
-        feat["TLT_TBT_spread_mom5"] = (
-            df["TLT_Ret"].rolling(5).sum() - df["TBT_Ret"].rolling(5).sum()
+    if "TLT_Ret" in df.columns and "AGG_Ret" in df.columns:
+        feat["TLT_AGG_spread_mom5"] = (
+            df["TLT_Ret"].rolling(5).sum() - df["AGG_Ret"].rolling(5).sum()
         )
 
     if "VIX" in df.columns:
@@ -171,13 +158,10 @@ def _engineer_features(df: pd.DataFrame, ret_cols: list) -> pd.DataFrame:
 
     return feat
 
-
 # ── Main extraction function ──────────────────────────────────────────────────
-
 def get_features_and_targets(df: pd.DataFrame):
     """
     Build return columns for target ETFs and engineer a rich feature set.
-
     Returns:
         input_features : list[str]
         target_etfs    : list[str]  e.g. ["TLT_Ret", ...]
@@ -240,9 +224,7 @@ def get_features_and_targets(df: pd.DataFrame):
 
     return input_features, target_etfs, tbill_rate, df, col_info
 
-
 # ── Dataset summary ───────────────────────────────────────────────────────────
-
 def dataset_summary(df: pd.DataFrame) -> dict:
     if df.empty:
         return {}
