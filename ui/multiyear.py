@@ -189,24 +189,95 @@ def run_multiyear_sweep(
     return sweep_results
 
 
+# ── Weighted scoring ──────────────────────────────────────────────────────────
+#
+# Per-year composite score:
+#   40% Ann. Return  (higher = better)
+#   20% Z-Score      (higher = better)
+#   20% Sharpe       (higher = better, positive preferred)
+#   20% Max Drawdown (lower magnitude = better, i.e. score on -max_dd)
+#
+# Each metric is min-max normalised across all valid years before weighting,
+# so no single metric dominates due to scale differences.
+
+W_RETURN = 0.40
+W_ZSCORE = 0.20
+W_SHARPE = 0.20
+W_DD     = 0.20
+
+
+def _compute_weighted_scores(valid: list) -> list:
+    """
+    Returns a copy of valid rows, each augmented with:
+      - 'weighted_score'  : float in [0, 1]
+      - 'score_breakdown' : dict of normalised component scores
+    """
+    def _minmax(vals):
+        arr = np.array(vals, dtype=float)
+        mn, mx = arr.min(), arr.max()
+        if mx == mn:
+            return np.ones(len(arr)) * 0.5
+        return (arr - mn) / (mx - mn)
+
+    returns = [r["ann_return"] if r["ann_return"] is not None else 0.0 for r in valid]
+    zscores = [r["z_score"]    if r["z_score"]    is not None else 0.0 for r in valid]
+    sharpes = [r["sharpe"]     if r["sharpe"]     is not None else 0.0 for r in valid]
+    # For drawdown: less negative is better → negate so higher = better
+    dds     = [-(r["max_dd"]   if r["max_dd"]     is not None else -1.0) for r in valid]
+
+    n_ret = _minmax(returns)
+    n_z   = _minmax(zscores)
+    n_sh  = _minmax(sharpes)
+    n_dd  = _minmax(dds)
+
+    scored = []
+    for i, r in enumerate(valid):
+        composite = (W_RETURN * n_ret[i] +
+                     W_ZSCORE * n_z[i]   +
+                     W_SHARPE * n_sh[i]  +
+                     W_DD     * n_dd[i])
+        scored.append({
+            **r,
+            "weighted_score": float(composite),
+            "score_breakdown": {
+                "Return (40%)":   float(n_ret[i]),
+                "Z-Score (20%)":  float(n_z[i]),
+                "Sharpe (20%)":   float(n_sh[i]),
+                "Max DD (20%)":   float(n_dd[i]),
+            },
+        })
+    return scored
+
+
 # ── Display helpers ───────────────────────────────────────────────────────────
 
-def _vote_tally_chart(sweep_results: list) -> go.Figure:
-    """Bar chart of how many start years voted for each ETF."""
-    signals = [r["signal"] for r in sweep_results if r["signal"] is not None]
-    counts  = Counter(signals)
+def _vote_tally_chart(scored: list) -> go.Figure:
+    """
+    Bar chart: weighted score accumulated per ETF across all start years.
+    Each year contributes its composite score to its predicted ETF's total.
+    The bar height = sum of weighted scores (not raw vote count).
+    """
+    from collections import defaultdict
+    etf_scores = defaultdict(float)
+    etf_counts = Counter()
 
-    # Sort by count desc
-    etfs   = sorted(counts.keys(), key=lambda e: -counts[e])
-    values = [counts[e] for e in etfs]
+    for r in scored:
+        etf = r["signal"]
+        etf_scores[etf] += r["weighted_score"]
+        etf_counts[etf] += 1
+
+    etfs   = sorted(etf_scores.keys(), key=lambda e: -etf_scores[e])
+    values = [etf_scores[e] for e in etfs]
+    counts = [etf_counts[e] for e in etfs]
     colors = [_etf_colour(e) for e in etfs]
-    total  = sum(values)
-    pcts   = [f"{v/total*100:.0f}%" for v in values]
+    total_score = sum(values)
+    pcts   = [f"{v/total_score*100:.0f}%" for v in values]
 
     fig = go.Figure(go.Bar(
         x=etfs,
         y=values,
-        text=[f"{v} votes<br>{p}" for v, p in zip(values, pcts)],
+        text=[f"{c} yr{'s' if c>1 else ''} · {p}<br>score {v:.2f}"
+              for c, p, v in zip(counts, pcts, values)],
         textposition="outside",
         marker_color=colors,
         marker_line_color="rgba(255,255,255,0.3)",
@@ -215,11 +286,14 @@ def _vote_tally_chart(sweep_results: list) -> go.Figure:
     fig.update_layout(
         template="plotly_dark",
         height=340,
-        title=dict(text="Signal Vote Tally Across Start Years", font=dict(size=15)),
+        title=dict(
+            text="Weighted Score per ETF  (40% Return · 20% Z · 20% Sharpe · 20% -MaxDD)",
+            font=dict(size=13),
+        ),
         xaxis_title="ETF",
-        yaxis_title="Number of Start Years",
-        yaxis=dict(dtick=1, range=[0, max(values) + 1.5]),
-        margin=dict(l=40, r=30, t=50, b=40),
+        yaxis_title="Cumulative Weighted Score",
+        yaxis=dict(range=[0, max(values) * 1.25]),
+        margin=dict(l=40, r=30, t=55, b=40),
         showlegend=False,
         bargap=0.35,
     )
@@ -274,29 +348,32 @@ def _conviction_scatter(sweep_results: list) -> go.Figure:
     return fig
 
 
-def _build_full_table(sweep_results: list) -> pd.DataFrame:
-    """Build the full per-year comparison DataFrame."""
+def _build_full_table(scored: list) -> pd.DataFrame:
+    """Build the full per-year comparison DataFrame, including weighted score."""
     rows = []
-    for r in sweep_results:
-        if r["error"]:
+    for r in scored:
+        if r.get("error"):
             rows.append({
-                "Start Year":  r["start_year"],
-                "Signal":      "ERROR",
-                "Conviction":  "—",
-                "Z-Score":     "—",
-                "Ann. Return": "—",
-                "Sharpe":      "—",
-                "Max Drawdown":"—",
-                "Lookback":    "—",
-                "Cache":       "—",
-                "Note":        r["error"][:40],
+                "Start Year":    r["start_year"],
+                "Signal":        "ERROR",
+                "Wtd Score":     "—",
+                "Conviction":    "—",
+                "Z-Score":       "—",
+                "Ann. Return":   "—",
+                "Sharpe":        "—",
+                "Max Drawdown":  "—",
+                "Lookback":      "—",
+                "Cache":         "—",
+                "Note":          r["error"][:40],
             })
         else:
+            ws = r.get("weighted_score")
             rows.append({
                 "Start Year":   r["start_year"],
                 "Signal":       r["signal"]      or "—",
+                "Wtd Score":    f"{ws:.3f}"       if ws   is not None else "—",
                 "Conviction":   r["conviction"]  or "—",
-                "Z-Score":      f"{r['z_score']:.2f}σ" if r["z_score"] is not None else "—",
+                "Z-Score":      f"{r['z_score']:.2f}σ"    if r["z_score"]    is not None else "—",
                 "Ann. Return":  f"{r['ann_return']*100:.2f}%" if r["ann_return"] is not None else "—",
                 "Sharpe":       f"{r['sharpe']:.2f}"          if r["sharpe"]     is not None else "—",
                 "Max Drawdown": f"{r['max_dd']*100:.2f}%"     if r["max_dd"]     is not None else "—",
@@ -307,61 +384,90 @@ def _build_full_table(sweep_results: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _consensus_banner(sweep_results: list):
-    """Show the consensus signal with vote count and strength."""
-    signals = [r["signal"] for r in sweep_results if r["signal"] is not None]
-    if not signals:
+def _consensus_banner(scored: list):
+    """
+    Show the consensus signal selected by highest cumulative weighted score.
+    Also shows vote count and avg weighted score for context.
+    """
+    if not scored:
         st.warning("No valid signals collected.")
         return
 
-    counts     = Counter(signals)
-    total      = len(signals)
-    top_signal = counts.most_common(1)[0][0]
-    top_votes  = counts.most_common(1)[0][1]
-    pct        = top_votes / total * 100
+    from collections import defaultdict
+    etf_total_score = defaultdict(float)
+    etf_counts      = Counter()
+    for r in scored:
+        etf = r["signal"]
+        etf_total_score[etf] += r["weighted_score"]
+        etf_counts[etf]      += 1
 
-    # Strength label
-    if pct >= 75:
+    # Winner = highest cumulative weighted score
+    top_signal  = max(etf_total_score, key=lambda e: etf_total_score[e])
+    top_score   = etf_total_score[top_signal]
+    total_score = sum(etf_total_score.values())
+    score_pct   = top_score / total_score * 100
+    top_votes   = etf_counts[top_signal]
+    total_years = len(scored)
+
+    # Avg weighted score of the winning ETF's years
+    avg_ws = top_score / top_votes
+
+    # Strength label based on score share
+    if score_pct >= 60:
         strength, bg = "🔥 Strong Consensus", "linear-gradient(135deg,#00b894,#00cec9)"
-    elif pct >= 50:
-        strength, bg = "✅ Majority Signal", "linear-gradient(135deg,#0984e3,#6c5ce7)"
+    elif score_pct >= 40:
+        strength, bg = "✅ Majority Signal",   "linear-gradient(135deg,#0984e3,#6c5ce7)"
     else:
-        strength, bg = "⚠️ Split Signal", "linear-gradient(135deg,#636e72,#2d3436)"
+        strength, bg = "⚠️ Split Signal",      "linear-gradient(135deg,#636e72,#2d3436)"
 
-    # Average Z-score for the top signal
-    z_vals = [r["z_score"] for r in sweep_results
-              if r["signal"] == top_signal and r["z_score"] is not None]
-    avg_z  = np.mean(z_vals) if z_vals else 0.0
+    # Avg component breakdown for the winning ETF
+    winners = [r for r in scored if r["signal"] == top_signal]
+    avg_ret = np.mean([r["ann_return"] for r in winners if r["ann_return"] is not None]) * 100
+    avg_z   = np.mean([r["z_score"]   for r in winners if r["z_score"]   is not None])
+    avg_sh  = np.mean([r["sharpe"]    for r in winners if r["sharpe"]    is not None])
+    avg_dd  = np.mean([r["max_dd"]    for r in winners if r["max_dd"]    is not None]) * 100
 
     st.markdown(f"""
     <div style="background:{bg}; padding:24px 28px; border-radius:16px;
                 box-shadow:0 8px 20px rgba(0,0,0,0.3); margin:16px 0;">
       <div style="color:rgba(255,255,255,0.75); font-size:12px;
                   letter-spacing:3px; margin-bottom:6px; text-align:center;">
-        CONSENSUS SIGNAL · APPROACH 2 · ALL START YEARS
+        WEIGHTED CONSENSUS · APPROACH 2 · ALL START YEARS
       </div>
       <h1 style="color:white; font-size:44px; font-weight:900; text-align:center;
                  margin:4px 0; text-shadow:2px 2px 6px rgba(0,0,0,0.4);">
         🎯 {top_signal}
       </h1>
-      <div style="text-align:center; color:rgba(255,255,255,0.85); font-size:16px; margin-top:8px;">
-        {strength} &nbsp;·&nbsp; <b>{top_votes}/{total}</b> years agree &nbsp;·&nbsp;
-        avg Z = <b>{avg_z:.2f}σ</b>
+      <div style="text-align:center; color:rgba(255,255,255,0.85); font-size:15px; margin-top:8px;">
+        {strength} &nbsp;·&nbsp;
+        Score share <b>{score_pct:.0f}%</b> &nbsp;·&nbsp;
+        <b>{top_votes}/{total_years}</b> years &nbsp;·&nbsp;
+        avg score <b>{avg_ws:.2f}</b>
+      </div>
+      <div style="display:flex; justify-content:center; gap:28px; margin-top:14px;
+                  flex-wrap:wrap; font-size:13px; color:rgba(255,255,255,0.7);">
+        <span>📈 Avg Return <b style="color:white">{avg_ret:+.1f}%</b></span>
+        <span>⚡ Avg Z <b style="color:white">{avg_z:.2f}σ</b></span>
+        <span>📊 Avg Sharpe <b style="color:white">{avg_sh:.2f}</b></span>
+        <span>📉 Avg MaxDD <b style="color:white">{avg_dd:.1f}%</b></span>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # Runner-up signals
-    if len(counts) > 1:
-        others = counts.most_common()[1:]
-        parts  = " &nbsp;|&nbsp; ".join(
+    # Runner-up ETFs by weighted score
+    others = sorted(
+        [(e, s) for e, s in etf_total_score.items() if e != top_signal],
+        key=lambda x: -x[1]
+    )
+    if others:
+        parts = " &nbsp;|&nbsp; ".join(
             f'<span style="color:{_etf_colour(e)}; font-weight:600;">{e}</span> '
-            f'<span style="color:#aaa;">({c} vote{"s" if c>1 else ""})</span>'
-            for e, c in others
+            f'<span style="color:#aaa;">(score {s:.2f} · {etf_counts[e]} yr{"s" if etf_counts[e]>1 else ""})</span>'
+            for e, s in others
         )
         st.markdown(
-            f'<div style="text-align:center; font-size:13px; color:#ccc; margin-top:4px;">'
-            f'Also picked: {parts}</div>',
+            f'<div style="text-align:center; font-size:13px; color:#ccc; margin-top:6px;">'
+            f'Also ranked: {parts}</div>',
             unsafe_allow_html=True,
         )
 
@@ -371,8 +477,8 @@ def _consensus_banner(sweep_results: list):
 def show_multiyear_results(sweep_results: list, sweep_years: list):
     """Render the full multi-year consensus UI."""
 
-    valid = [r for r in sweep_results if r["signal"] is not None]
-    failed = [r for r in sweep_results if r["error"] is not None]
+    valid  = [r for r in sweep_results if r["signal"] is not None]
+    failed = [r for r in sweep_results if r["error"]  is not None]
 
     if failed:
         with st.expander(f"⚠️ {len(failed)} year(s) failed — click to see details"):
@@ -383,8 +489,14 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
         st.error("No valid results from any start year.")
         return
 
+    # ── Compute weighted scores for all valid rows ────────────────────────────
+    scored = _compute_weighted_scores(valid)
+    # Merge scores back into full sweep_results (including failed rows)
+    scored_by_yr = {r["start_year"]: r for r in scored}
+    full_scored  = [scored_by_yr.get(r["start_year"], r) for r in sweep_results]
+
     # ── Consensus banner ──────────────────────────────────────────────────────
-    _consensus_banner(sweep_results)
+    _consensus_banner(scored)
 
     st.divider()
 
@@ -392,11 +504,11 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
     col_left, col_right = st.columns([1, 1])
 
     with col_left:
-        tally_fig = _vote_tally_chart(valid)
+        tally_fig = _vote_tally_chart(scored)
         st.plotly_chart(tally_fig, use_container_width=True)
 
     with col_right:
-        scatter_fig = _conviction_scatter(valid)
+        scatter_fig = _conviction_scatter(scored)
         if scatter_fig:
             st.plotly_chart(scatter_fig, use_container_width=True)
 
@@ -405,11 +517,12 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
     # ── Full comparison table ─────────────────────────────────────────────────
     st.subheader("📋 Full Per-Year Breakdown")
     st.caption(
-        "Each row = Approach 2 trained from that start year forward. "
+        "**Wtd Score** = 40% Ann. Return + 20% Z-Score + 20% Sharpe + 20% (−Max DD), "
+        "each metric min-max normalised across all years.  "
         "⚡ = loaded from cache (no retraining). 🆕 = freshly trained."
     )
 
-    table_df = _build_full_table(sweep_results)
+    table_df = _build_full_table(full_scored)
 
     def _style_table(df: pd.DataFrame):
         def _row_style(row):
@@ -417,14 +530,16 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
             sig = row.get("Signal", "")
             if sig and sig not in ("—", "ERROR"):
                 col = _etf_colour(sig)
-                # Softer tint on signal cell
                 styles[list(df.columns).index("Signal")] = (
                     f"background-color: {col}22; color: {col}; font-weight: 700;"
                 )
+                # Highlight the Wtd Score cell too
+                if "Wtd Score" in df.columns:
+                    styles[list(df.columns).index("Wtd Score")] = (
+                        f"color: {col}; font-weight: 700;"
+                    )
             if row.get("Note", ""):
-                styles = [
-                    "color: #ff6b6b; font-style: italic;"
-                ] * len(row)
+                styles = ["color: #ff6b6b; font-style: italic;"] * len(row)
             return styles
 
         return (
@@ -455,17 +570,24 @@ Each start year defines the *training regime* the model learns from.
 
 A different data window = a different view of which ETF leads in risk-off or momentum environments.
 
-**How to use the consensus:**
-| Votes for top ETF | Interpretation | Action |
+**How the weighted consensus works:**
+Each year's result gets a composite score (0–1) based on four normalised metrics:
+
+| Metric | Weight | Logic |
 |---|---|---|
-| 7–8 / 8 | Very strong consensus | High confidence signal |
-| 5–6 / 8 | Majority agreement | Moderate confidence |
-| 3–4 / 8 | Split market | Consider waiting or splitting position |
-| ≤ 2 / 8 | No consensus | Regime is unstable — treat with caution |
+| Ann. Return | **40%** | Higher is better |
+| Z-Score | **20%** | Higher = more decisive model |
+| Sharpe Ratio | **20%** | Higher and positive is better |
+| Max Drawdown | **20%** | Lower magnitude is better |
 
-**Z-Score** measures how decisively the model chose the top ETF over alternatives.
-A Z > 1.5σ is considered High conviction regardless of which ETF was chosen.
+The ETF with the highest **total cumulative score** across all start years wins. This means an ETF that scores well consistently beats one that wins by raw votes alone.
 
-> 💡 **Best practice:** Weight the consensus signal most heavily when 
-> *both* the vote count and the average Z-score are high simultaneously.
+**Score share interpretation:**
+| Score share | Interpretation |
+|---|---|
+| ≥ 60% | Strong consensus — high confidence |
+| 40–60% | Majority signal — moderate confidence |
+| < 40% | Split signal — regime unstable, consider caution |
+
+> 💡 **Best practice:** Highest confidence when score share is high **and** the winning ETF also has above-average Z-scores across its years.
     """)
