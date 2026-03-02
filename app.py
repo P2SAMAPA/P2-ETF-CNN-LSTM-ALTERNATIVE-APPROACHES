@@ -8,6 +8,7 @@ P2-ETF-CNN-LSTM-ALTERNATIVE-APPROACHES
 - Ann. Return compared vs SPY in metrics row
 - Max Daily DD shows date it occurred
 - Conviction panel: compact ETF probability list
+- [NEW] Multi-Year Sweep tab: runs 8 start years, vote tally + comparison table
 """
 
 import os
@@ -32,6 +33,7 @@ from ui.components import (
     show_metrics_row, show_comparison_table, show_audit_trail,
     show_all_signals_panel,
 )
+from ui.multiyear import run_multiyear_sweep, show_multiyear_results
 
 st.set_page_config(page_title="P2-ETF-CNN-LSTM", page_icon="🧠", layout="wide")
 
@@ -43,6 +45,8 @@ for key, default in [
     ("test_dates", None), ("test_slice", None), ("optimal_lookback", None),
     ("df_for_chart", None), ("tbill_rate", None), ("target_etfs", None),
     ("from_cache", False),
+    # Multi-year sweep state
+    ("multiyear_ready", False), ("multiyear_results", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -68,7 +72,6 @@ with st.sidebar:
 # ── Title ─────────────────────────────────────────────────────────────────────
 st.title("🧠 P2-ETF-CNN-LSTM")
 st.caption("Approach 1: Wavelet  ·  Approach 2: Regime-Conditioned  ·  Approach 3: Multi-Scale Parallel")
-st.caption("Winner selected by highest raw annualised return on out-of-sample test set.")
 
 if not HF_TOKEN:
     st.error("❌ HF_TOKEN secret not found.")
@@ -83,6 +86,7 @@ if df_raw.empty:
 
 freshness = check_data_freshness(df_raw)
 show_freshness_status(freshness)
+last_date_str = str(freshness.get("last_date_in_data", "unknown"))
 
 # ── Dataset info sidebar ──────────────────────────────────────────────────────
 with st.sidebar:
@@ -112,7 +116,7 @@ if run_button:
         st.stop()
 
     n_etfs    = len(target_etfs)
-    n_classes = n_etfs   # CASH is overlay only — model always picks from ETFs
+    n_classes = n_etfs
 
     st.info(
         f"🎯 **Targets:** {', '.join([t.replace('_Ret','') for t in target_etfs])}  ·  "
@@ -120,7 +124,6 @@ if run_button:
         f"**T-bill:** {tbill_rate*100:.2f}%"
     )
 
-    # ── Raw arrays ────────────────────────────────────────────────────────────
     X_raw = df[input_features].values.astype(np.float32)
     y_raw = np.clip(df[target_etfs].values.astype(np.float32), -0.5, 0.5)
 
@@ -132,8 +135,6 @@ if run_button:
         mask = np.isnan(y_raw[:, j])
         if mask.any():
             y_raw[mask, j] = 0.0
-
-    last_date_str = str(freshness.get("last_date_in_data", "unknown"))
 
     # ── Auto-select lookback ──────────────────────────────────────────────────
     lb_key    = make_cache_key(last_date_str, start_yr, fee_bps, int(epochs),
@@ -186,12 +187,11 @@ if run_button:
         results, trained_info = {}, {}
         progress = st.progress(0, text="Training Approach 1...")
 
-        for approach, train_fn, predict_fn, train_kwargs in [
+        for approach, train_fn, predict_fn in [
             ("Approach 1",
              lambda: train_approach1(X_train_s, y_train_l, X_val_s, y_val_l,
                                      n_classes=n_classes, epochs=int(epochs)),
-             lambda m: predict_approach1(m[0], X_test_s),
-             None),
+             lambda m: predict_approach1(m[0], X_test_s)),
             ("Approach 2",
              lambda: train_approach2(X_train_s, y_train_l, X_val_s, y_val_l,
                                      X_flat_all=X_raw, feature_names=input_features,
@@ -199,13 +199,11 @@ if run_button:
                                      val_size=val_size, n_classes=n_classes,
                                      epochs=int(epochs)),
              lambda m: predict_approach2(m[0], X_test_s, X_raw, m[3], m[2],
-                                          lookback, train_size, val_size),
-             None),
+                                          lookback, train_size, val_size)),
             ("Approach 3",
              lambda: train_approach3(X_train_s, y_train_l, X_val_s, y_val_l,
                                      n_classes=n_classes, epochs=int(epochs)),
-             lambda m: predict_approach3(m[0], X_test_s),
-             None),
+             lambda m: predict_approach3(m[0], X_test_s)),
         ]:
             try:
                 model_out    = train_fn()
@@ -229,7 +227,6 @@ if run_button:
             "test_dates": list(test_dates), "test_slice": test_slice,
         })
 
-    # ── Persist to session state ──────────────────────────────────────────────
     st.session_state.update({
         "results": results, "trained_info": trained_info,
         "test_dates": test_dates, "test_slice": test_slice,
@@ -238,68 +235,116 @@ if run_button:
         "output_ready": True,
     })
 
-# ── Render (persists across reruns via session_state) ─────────────────────────
-if not st.session_state.output_ready:
-    st.info("👈 Configure parameters and click **🚀 Run All 3 Approaches**.")
-    st.stop()
+# ── TABS ──────────────────────────────────────────────────────────────────────
+tab_single, tab_sweep = st.tabs(["📊 Single-Year Results", "🔁 Multi-Year Consensus Sweep"])
 
-results          = st.session_state.results
-trained_info     = st.session_state.trained_info
-test_dates       = st.session_state.test_dates
-test_slice       = st.session_state.test_slice
-optimal_lookback = st.session_state.optimal_lookback
-df               = st.session_state.df_for_chart
-tbill_rate       = st.session_state.tbill_rate
-target_etfs      = st.session_state.target_etfs
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — existing single-year output (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_single:
+    if not st.session_state.output_ready:
+        st.info("👈 Configure parameters and click **🚀 Run All 3 Approaches**.")
+        st.stop()
 
-winner_name = select_winner(results)
-winner_res  = results.get(winner_name)
+    results          = st.session_state.results
+    trained_info     = st.session_state.trained_info
+    test_dates       = st.session_state.test_dates
+    test_slice       = st.session_state.test_slice
+    optimal_lookback = st.session_state.optimal_lookback
+    df               = st.session_state.df_for_chart
+    tbill_rate       = st.session_state.tbill_rate
+    target_etfs      = st.session_state.target_etfs
 
-if winner_res is None:
-    st.error("❌ All approaches failed.")
-    st.stop()
+    winner_name = select_winner(results)
+    winner_res  = results.get(winner_name)
 
-if st.session_state.from_cache:
-    st.success("⚡ Showing cached results.")
+    if winner_res is None:
+        st.error("❌ All approaches failed.")
+        st.stop()
 
-next_date = get_next_signal_date()
-st.divider()
+    st.caption("Winner selected by highest raw annualised return on out-of-sample test set.")
 
-show_signal_banner(winner_res["next_signal"], next_date, winner_name)
+    next_date = get_next_signal_date()
+    st.divider()
 
-winner_proba = trained_info[winner_name]["proba"]
-conviction   = compute_conviction(winner_proba[-1], target_etfs, include_cash=False)
-show_conviction_panel(conviction)
+    show_signal_banner(winner_res["next_signal"], next_date, winner_name)
 
-st.divider()
+    winner_proba = trained_info[winner_name]["proba"]
+    conviction   = compute_conviction(winner_proba[-1], target_etfs, include_cash=False)
+    show_conviction_panel(conviction)
 
-all_signals = {
-    name: {"signal": res["next_signal"],
-           "proba":  trained_info[name]["proba"][-1],
-           "is_winner": name == winner_name}
-    for name, res in results.items() if res is not None
-}
-show_all_signals_panel(all_signals, target_etfs, False, next_date, optimal_lookback)
+    st.divider()
 
-st.divider()
-st.subheader(f"📊 {winner_name} — Performance Metrics")
+    all_signals = {
+        name: {"signal": res["next_signal"],
+               "proba":  trained_info[name]["proba"][-1],
+               "is_winner": name == winner_name}
+        for name, res in results.items() if res is not None
+    }
+    show_all_signals_panel(all_signals, target_etfs, False, next_date, optimal_lookback)
 
-# Compute SPY annualised return directly from raw returns for metrics comparison
-spy_ann = None
-if "SPY_Ret" in df.columns:
-    spy_raw = df["SPY_Ret"].iloc[test_slice].values.copy().astype(float)
-    spy_raw = spy_raw[~np.isnan(spy_raw)]
-    spy_raw = np.clip(spy_raw, -0.5, 0.5)
-    if len(spy_raw) > 5:
-        spy_cum = np.prod(1 + spy_raw)
-        spy_ann = float(spy_cum ** (252 / len(spy_raw)) - 1)
+    st.divider()
+    st.subheader(f"📊 {winner_name} — Performance Metrics")
 
-show_metrics_row(winner_res, tbill_rate, spy_ann_return=spy_ann)
+    spy_ann = None
+    if "SPY_Ret" in df.columns:
+        spy_raw = df["SPY_Ret"].iloc[test_slice].values.copy().astype(float)
+        spy_raw = spy_raw[~np.isnan(spy_raw)]
+        spy_raw = np.clip(spy_raw, -0.5, 0.5)
+        if len(spy_raw) > 5:
+            spy_cum = np.prod(1 + spy_raw)
+            spy_ann = float(spy_cum ** (252 / len(spy_raw)) - 1)
 
-st.divider()
-st.subheader("🏆 Approach Comparison (Winner = Highest Raw Annualised Return)")
-show_comparison_table(build_comparison_table(results, winner_name))
+    show_metrics_row(winner_res, tbill_rate, spy_ann_return=spy_ann)
 
-st.divider()
-st.subheader(f"📋 Audit Trail — {winner_name} (Last 20 Trading Days)")
-show_audit_trail(winner_res["audit_trail"])
+    st.divider()
+    st.subheader("🏆 Approach Comparison (Winner = Highest Raw Annualised Return)")
+    show_comparison_table(build_comparison_table(results, winner_name))
+
+    st.divider()
+    st.subheader(f"📋 Audit Trail — {winner_name} (Last 20 Trading Days)")
+    show_audit_trail(winner_res["audit_trail"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — Multi-Year Consensus Sweep
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_sweep:
+    st.subheader("🔁 Multi-Year Consensus Sweep")
+    st.markdown(
+        "Runs the winner model (Approach 2 proxy) across **8 start years** "
+        "and aggregates signals into a consensus vote. "
+        "Each year uses the same fee, epochs, and split settings as the sidebar. "
+        "Results are cached — only untrained years incur compute."
+    )
+
+    SWEEP_YEARS = [2010, 2012, 2014, 2016, 2018, 2019, 2021, 2023]
+
+    col_l, col_r = st.columns([2, 1])
+    with col_l:
+        st.caption(f"Sweep years: {', '.join(str(y) for y in SWEEP_YEARS)}")
+    with col_r:
+        sweep_button = st.button("🚀 Run Consensus Sweep", type="primary", use_container_width=True)
+
+    if sweep_button:
+        st.session_state.multiyear_ready = False
+        sweep_results = run_multiyear_sweep(
+            df_raw         = df_raw,
+            sweep_years    = SWEEP_YEARS,
+            fee_bps        = fee_bps,
+            epochs         = int(epochs),
+            split_option   = split_option,
+            last_date_str  = last_date_str,
+            train_pct      = train_pct,
+            val_pct        = val_pct,
+        )
+        st.session_state.multiyear_results = sweep_results
+        st.session_state.multiyear_ready   = True
+
+    if st.session_state.multiyear_ready and st.session_state.multiyear_results:
+        show_multiyear_results(
+            st.session_state.multiyear_results,
+            sweep_years = SWEEP_YEARS,
+        )
+    elif not st.session_state.multiyear_ready:
+        st.info("Click **🚀 Run Consensus Sweep** to analyse all start years at once.")
