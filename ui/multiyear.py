@@ -133,6 +133,7 @@ def run_multiyear_sweep(
                 result   = cached_data["result"]
                 proba    = cached_data["proba"]
                 row["from_cache"] = True
+                row["run_date"]   = cached_data.get("run_date", last_date_str)
             else:
                 X_seq, y_seq = build_sequences(X_raw, y_raw, lookback)
                 y_labels     = returns_to_labels(y_seq)
@@ -163,12 +164,16 @@ def run_multiyear_sweep(
                     preds, proba, y_test_r, test_dates,
                     target_etfs, fee_bps, tbill_rate,
                 )
-                save_cache(cache_key, {"result": result, "proba": proba})
+                from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td2
+                _run_date = (_dt2.now(_tz2.utc) - _td2(hours=5)).strftime("%Y-%m-%d")
+                save_cache(cache_key, {"result": result, "proba": proba, "run_date": _run_date})
 
             # ── Conviction ────────────────────────────────────────────────────
             conviction = compute_conviction(proba[-1], target_etfs, include_cash=False)
 
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
             row.update({
+                "run_date":   (_dt.now(_tz.utc) - _td(hours=5)).strftime("%Y-%m-%d"),
                 "signal":     result["next_signal"],
                 "z_score":    conviction["z_score"],
                 "conviction": conviction["label"],
@@ -384,7 +389,7 @@ def _build_full_table(scored: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _consensus_banner(scored: list):
+def _consensus_banner(scored: list, run_date_str: str = ""):
     """
     Show the consensus signal selected by highest cumulative weighted score.
     Also shows vote count and avg weighted score for context.
@@ -432,7 +437,7 @@ def _consensus_banner(scored: list):
                 box-shadow:0 8px 20px rgba(0,0,0,0.3); margin:16px 0;">
       <div style="color:rgba(255,255,255,0.75); font-size:12px;
                   letter-spacing:3px; margin-bottom:6px; text-align:center;">
-        WEIGHTED CONSENSUS · APPROACH 2 · ALL START YEARS
+        WEIGHTED CONSENSUS · APPROACH 2 · ALL START YEARS · {run_date_str}
       </div>
       <h1 style="color:white; font-size:44px; font-weight:900; text-align:center;
                  margin:4px 0; text-shadow:2px 2px 6px rgba(0,0,0,0.4);">
@@ -496,7 +501,10 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
     full_scored  = [scored_by_yr.get(r["start_year"], r) for r in sweep_results]
 
     # ── Consensus banner ──────────────────────────────────────────────────────
-    _consensus_banner(scored)
+    # Derive run_date from most recent result
+    run_dates = [r.get("run_date", "") for r in scored if r.get("run_date")]
+    run_date_str = max(run_dates) if run_dates else ""
+    _consensus_banner(scored, run_date_str=run_date_str)
 
     st.divider()
 
