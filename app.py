@@ -315,16 +315,48 @@ with tab_sweep:
         "Runs the winner model (Approach 2 proxy) across **8 start years** "
         "and aggregates signals into a consensus vote. "
         "Each year uses the same fee, epochs, and split settings as the sidebar. "
-        "Results are cached — only untrained years incur compute."
+        "Results are cached per data date — cache auto-invalidates when new data arrives."
     )
 
     SWEEP_YEARS = [2010, 2012, 2014, 2016, 2018, 2019, 2021, 2023]
 
+    # ── Freshness check ───────────────────────────────────────────────────────
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    today_est = (_dt.now(_tz.utc) - _td(hours=5)).strftime("%Y-%m-%d")
+
+    # Detect if current session results are stale (from a different data date)
+    cached_results = st.session_state.get("multiyear_results")
+    cached_data_date = None
+    if cached_results:
+        run_dates = [r.get("run_date", "") for r in cached_results if r.get("run_date")]
+        cached_data_date = max(run_dates) if run_dates else None
+
+    results_are_stale = (
+        cached_data_date is not None and
+        cached_data_date < today_est and
+        last_date_str not in (cached_data_date or "")
+    )
+
+    if results_are_stale:
+        st.warning(
+            f"⚠️ Showing results from **{cached_data_date}** — today's data "
+            f"({last_date_str}) is now available. Click **🚀 Run Consensus Sweep** "
+            f"to refresh with today's signals.",
+            icon="📅"
+        )
+    elif cached_data_date:
+        st.success(f"✅ Results current — data as of **{last_date_str}**", icon="📅")
+
     col_l, col_r = st.columns([2, 1])
     with col_l:
-        st.caption(f"Sweep years: {', '.join(str(y) for y in SWEEP_YEARS)}")
+        st.caption(f"Sweep years: {', '.join(str(y) for y in SWEEP_YEARS)} · Data date: {last_date_str}")
     with col_r:
-        sweep_button = st.button("🚀 Run Consensus Sweep", type="primary", use_container_width=True)
+        sweep_button = st.button(
+            "🚀 Run Consensus Sweep",
+            type="primary",
+            use_container_width=True,
+            help="Re-runs if data has updated since last sweep"
+        )
 
     if sweep_button:
         st.session_state.multiyear_ready = False
