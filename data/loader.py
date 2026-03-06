@@ -99,21 +99,6 @@ def _to_returns(series: pd.Series) -> pd.Series:
 def _engineer_features(df: pd.DataFrame, ret_cols: list) -> pd.DataFrame:
     """
     Build a rich feature set from raw macro + ETF return columns.
-    Features added per ETF return:
-      - 1d, 5d, 21d lagged returns
-      - 5d, 21d rolling volatility
-      - 5d, 21d momentum (cumulative return)
-
-    Features added per macro column:
-      - raw value (z-scored over rolling 252d window)
-      - 5d change
-      - 1d lag
-
-    Also adds:
-      - TBILL_3M as a feature (rate level)
-      - VIX regime flag (VIX > 25)
-      - Yield curve slope (already T10Y2Y)
-      - Cross-asset momentum: spread between TLT_ret and AGG_ret
     """
     feat = pd.DataFrame(index=df.index)
 
@@ -173,12 +158,6 @@ def _engineer_features(df: pd.DataFrame, ret_cols: list) -> pd.DataFrame:
 def get_features_and_targets(df: pd.DataFrame):
     """
     Build return columns for target ETFs and engineer a rich feature set.
-    Returns:
-        input_features : list[str]
-        target_etfs    : list[str] e.g. ["TLT_Ret", ...]
-        tbill_rate     : float
-        df_out         : DataFrame with all columns
-        col_info       : dict of diagnostics
     """
     missing = [c for c in TARGET_ETF_COLS if c not in df.columns]
     if missing:
@@ -206,6 +185,9 @@ def get_features_and_targets(df: pd.DataFrame):
     # ── Drop NaN from first pct_change row ────────────────────────────────────
     df = df.dropna(subset=target_etfs).copy()
 
+    if df.empty:
+        raise ValueError("No data after dropping NaN returns. Check input data.")
+
     # ── Engineer features ─────────────────────────────────────────────────────
     feat_df = _engineer_features(df, target_etfs)
 
@@ -216,6 +198,10 @@ def get_features_and_targets(df: pd.DataFrame):
     # Drop rows with NaN in features (from lags/rolling)
     feat_cols = list(feat_df.columns)
     df = df.dropna(subset=feat_cols).copy()
+
+    if df.empty:
+        raise ValueError("No data after feature engineering (all rows became NaN). "
+                        "Dataset may be too short for lookback periods.")
 
     # ── T-bill rate ───────────────────────────────────────────────────────────
     tbill_rate = 0.045
