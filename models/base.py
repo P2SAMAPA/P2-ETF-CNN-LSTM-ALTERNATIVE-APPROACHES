@@ -60,37 +60,106 @@ def load_cache(key):
 # ── Sequence builder ──────────────────────────────────────────────────────────
 
 def build_sequences(features, targets, lookback):
+	"""
+	Build sequences for time series modeling.
+	
+	Args:
+		features: array of shape (n_samples, n_features)
+		targets: array of shape (n_samples,) or (n_samples, n_targets)
+		lookback: int, number of time steps to look back
+	
+	Returns:
+		X: array of shape (n_sequences, lookback, n_features)
+		y: array of shape (n_sequences,) or (n_sequences, n_targets)
+	
+	Raises:
+		ValueError: if insufficient data to create sequences
+	"""
+	n_samples = len(features)
+	if n_samples <= lookback:
+		raise ValueError(
+			f"Insufficient data for lookback={lookback}. "
+			f"Need at least {lookback + 1} samples, but got {n_samples}. "
+			f"Try selecting an earlier start year or smaller lookback."
+		)
+	
 	X, y = [], []
-	for i in range(lookback, len(features)):
+	for i in range(lookback, n_samples):
 		X.append(features[i - lookback: i])
 		y.append(targets[i])
-	return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+	
+	X_arr = np.array(X, dtype=np.float32)
+	y_arr = np.array(y, dtype=np.float32)
+	
+	# Validate shapes
+	if X_arr.ndim != 3:
+		raise ValueError(f"Expected X to be 3D (samples, lookback, features), got shape {X_arr.shape}")
+	
+	return X_arr, y_arr
 
 
 # ── Train / val / test split ──────────────────────────────────────────────────
 
 def train_val_test_split(X, y, train_pct=0.70, val_pct=0.15):
-	n  = len(X)
+	"""
+	Split data into train/val/test sets.
+	
+	Args:
+		X: features array
+		y: targets array
+		train_pct: percentage for training
+		val_pct: percentage for validation (remainder goes to test)
+	
+	Returns:
+		X_train, y_train, X_val, y_val, X_test, y_test
+	"""
+	n = len(X)
 	if n == 0:
 		raise ValueError("Cannot split empty array. Data may be too small for the selected lookback and date range.")
+	
+	# Calculate split indices
 	t1 = int(n * train_pct)
 	t2 = int(n * (train_pct + val_pct))
-	# Ensure at least 1 sample in each split if possible
-	if t1 == 0 or t2 == t1 or n == t2:
-		raise ValueError(f"Insufficient data for split: n={n}, train_end={t1}, val_end={t2}. Try smaller lookback or larger date range.")
+	
+	# Ensure minimum sizes for each split
+	min_size = 1
+	if t1 < min_size:
+		raise ValueError(
+			f"Training set too small: {t1} samples. "
+			f"Need at least {min_size}. Total sequences: {n}. "
+			f"Try reducing lookback or using a larger date range."
+		)
+	if t2 - t1 < min_size:
+		raise ValueError(
+			f"Validation set too small: {t2 - t1} samples. "
+			f"Need at least {min_size}. Total sequences: {n}. "
+			f"Try adjusting train/val split percentages."
+		)
+	if n - t2 < min_size:
+		raise ValueError(
+			f"Test set too small: {n - t2} samples. "
+			f"Need at least {min_size}. Total sequences: {n}."
+		)
+	
 	return X[:t1], y[:t1], X[t1:t2], y[t1:t2], X[t2:], y[t2:]
 
 
 # ── Feature scaling ───────────────────────────────────────────────────────────
 
 def scale_features(X_train, X_val, X_test):
-	# Handle edge cases where arrays might be empty or wrong dimensions
+	"""
+	Scale features using RobustScaler.
+	
+	Handles 2D and 3D arrays by reshaping to 2D for scaling then back.
+	"""
 	if X_train.size == 0:
 		raise ValueError("X_train is empty. Cannot scale features.")
 	
-	# Ensure 3D shape (samples, timesteps, features)
+	# Handle different input dimensions
+	orig_train_shape = X_train.shape
+	
 	if X_train.ndim == 2:
-		# If 2D, assume (samples, features) and add time dimension
+		# Reshape to 3D: (samples, 1, features)
 		X_train = X_train.reshape(X_train.shape[0], 1, X_train.shape[1])
 		if X_val.size > 0:
 			X_val = X_val.reshape(X_val.shape[0], 1, X_val.shape[1])
@@ -100,30 +169,38 @@ def scale_features(X_train, X_val, X_test):
 		raise ValueError(f"Expected 2D or 3D X_train, got shape {X_train.shape}")
 	
 	n_feat = X_train.shape[2]
+	
+	# Fit scaler on training data only
 	scaler = RobustScaler()
 	scaler.fit(X_train.reshape(-1, n_feat))
+	
 	def _t(X):
+		"""Transform array while preserving shape."""
 		if X.size == 0:
 			return X
 		s = X.shape
 		return scaler.transform(X.reshape(-1, n_feat)).reshape(s)
+	
 	return _t(X_train), _t(X_val), _t(X_test), scaler
 
 
 # ── Label builder (no CASH class — CASH is a risk overlay) ───────────────────
 
 def returns_to_labels(y_raw):
-	"""Simple argmax — model always predicts one of the ETFs.
+	"""
+	Convert returns/probabilities to integer labels.
 	
-	Handles both 1D integer labels (returns as-is) and 
-	2D one-hot/probability arrays (converts via argmax).
+	Handles:
+	- 1D array: returns as integer labels
+	- 2D array: applies argmax along axis 1
 	"""
 	y_raw = np.asarray(y_raw)
+	
 	if y_raw.ndim == 1:
-		# Already integer labels (from build_sequences when targets is 1D per timestep)
+		# Already integer labels
 		return y_raw.astype(np.int32)
 	elif y_raw.ndim == 2:
-		# One-hot encoded or probability distribution across classes
+		# One-hot encoded or probability distribution
 		return np.argmax(y_raw, axis=1).astype(np.int32)
 	else:
 		raise ValueError(f"Expected 1D or 2D array, got shape {y_raw.shape}")
@@ -132,15 +209,32 @@ def returns_to_labels(y_raw):
 # ── Class weights ─────────────────────────────────────────────────────────────
 
 def compute_class_weights(y_labels, n_classes):
+	"""
+	Compute balanced class weights.
+	
+	Args:
+		y_labels: 1D array of integer labels
+		n_classes: total number of classes
+	
+	Returns:
+		dict mapping class index to weight
+	"""
+	if len(y_labels) == 0:
+		# Return uniform weights if no labels
+		return {c: 1.0 for c in range(n_classes)}
+	
 	present = np.unique(y_labels)
 	try:
 		weights = compute_class_weight("balanced", classes=present, y=y_labels)
 		weight_dict = {int(c): float(w) for c, w in zip(present, weights)}
 	except Exception:
 		weight_dict = {}
+	
+	# Ensure all classes have a weight
 	for c in range(n_classes):
 		if c not in weight_dict:
 			weight_dict[c] = 1.0
+	
 	return weight_dict
 
 
@@ -174,6 +268,11 @@ def classification_head(x, n_classes, dropout=0.3):
 
 def find_best_lookback(X_raw, y_raw, train_pct, val_pct, n_classes,
 						include_cash=False, candidates=None):
+	"""
+	Find optimal lookback by testing candidates.
+	
+	Returns best lookback from candidates, defaults to first candidate if none work.
+	"""
 	from tensorflow import keras
 
 	if candidates is None:
