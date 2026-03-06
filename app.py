@@ -16,17 +16,17 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-from data.loader      import (load_dataset, check_data_freshness,
-                               get_features_and_targets, dataset_summary)
-from utils.calendar   import get_est_time, get_next_signal_date
-from models.base      import (build_sequences, train_val_test_split,
-                               scale_features, returns_to_labels,
-                               find_best_lookback, make_cache_key,
-                               save_cache, load_cache)
-from models.approach1_wavelet    import train_approach1, predict_approach1
-from models.approach2_regime     import train_approach2, predict_approach2
+from data.loader import (load_dataset, check_data_freshness,
+                         get_features_and_targets, dataset_summary)
+from utils.calendar import get_est_time, get_next_signal_date
+from models.base import (build_sequences, train_val_test_split,
+                         scale_features, returns_to_labels,
+                         find_best_lookback, make_cache_key,
+                         save_cache, load_cache)
+from models.approach1_wavelet import train_approach1, predict_approach1
+from models.approach2_regime import train_approach2, predict_approach2
 from models.approach3_multiscale import train_approach3, predict_approach3
-from strategy.backtest  import execute_strategy, select_winner, build_comparison_table
+from strategy.backtest import execute_strategy, select_winner, build_comparison_table
 from signals.conviction import compute_conviction
 from ui.components import (
     show_freshness_status, show_signal_banner, show_conviction_panel,
@@ -57,9 +57,9 @@ with st.sidebar:
     st.write(f"🕒 **EST:** {get_est_time().strftime('%H:%M:%S')}")
     st.divider()
 
-    start_yr     = st.slider("📅 Start Year", 2010, 2024, 2016)
-    fee_bps      = st.slider("💰 Fee (bps)", 0, 50, 10)
-    epochs       = st.number_input("🔁 Max Epochs", 20, 150, 80, step=10)
+    start_yr = st.slider("📅 Start Year", 2010, 2024, 2016)
+    fee_bps = st.slider("💰 Fee (bps)", 0, 50, 10)
+    epochs = st.number_input("🔁 Max Epochs", 20, 150, 80, step=10)
 
     st.divider()
     split_option = st.selectbox("📊 Train/Val/Test Split", ["70/15/15", "80/10/10"], index=0)
@@ -71,7 +71,7 @@ with st.sidebar:
 
 # ── Title ─────────────────────────────────────────────────────────────────────
 st.title("🧠 P2-ETF-CNN-LSTM")
-st.caption("Approach 1: Wavelet  ·  Approach 2: Regime-Conditioned  ·  Approach 3: Multi-Scale Parallel")
+st.caption("Approach 1: Wavelet · Approach 2: Regime-Conditioned · Approach 3: Multi-Scale Parallel")
 
 if not HF_TOKEN:
     st.error("❌ HF_TOKEN secret not found.")
@@ -105,22 +105,35 @@ with st.sidebar:
 if run_button:
     st.session_state.output_ready = False
 
-    df = df_raw[df_raw.index.year >= start_yr].copy()
-    st.write(f"📅 **Data:** {df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')} "
-             f"({df.index[-1].year - df.index[0].year + 1} years)")
+    # CRITICAL FIX: Keep extra history for feature engineering (252 days for z-scores + 21 for lags)
+    # Then filter to actual start year AFTER feature engineering
+    min_date_for_features = pd.Timestamp(f"{start_yr}-01-01") - pd.Timedelta(days=400)
+    df_full = df_raw[df_raw.index >= min_date_for_features].copy()
+
+    st.write(f"📅 **Data:** {df_full.index[0].strftime('%Y-%m-%d')} → {df_full.index[-1].strftime('%Y-%m-%d')} "
+             f"({df_full.index[-1].year - df_full.index[0].year + 1} years)")
 
     try:
-        input_features, target_etfs, tbill_rate, df, _ = get_features_and_targets(df)
+        input_features, target_etfs, tbill_rate, df_processed, _ = get_features_and_targets(df_full)
     except ValueError as e:
         st.error(str(e))
         st.stop()
 
-    n_etfs    = len(target_etfs)
+    # NOW filter to actual start year after features are calculated
+    df = df_processed[df_processed.index.year >= start_yr].copy()
+
+    if len(df) == 0:
+        st.error(f"No data available from {start_yr} onwards after feature engineering. "
+                 f"Latest available: {df_processed.index[-1].strftime('%Y-%m-%d')}. "
+                 f"Try an earlier start year.")
+        st.stop()
+
+    n_etfs = len(target_etfs)
     n_classes = n_etfs
 
     st.info(
-        f"🎯 **Targets:** {', '.join([t.replace('_Ret','') for t in target_etfs])}  ·  "
-        f"**Features:** {len(input_features)} signals  ·  "
+        f"🎯 **Targets:** {', '.join([t.replace('_Ret','') for t in target_etfs])} · "
+        f"**Features:** {len(input_features)} signals · "
         f"**T-bill:** {tbill_rate*100:.2f}%"
     )
 
@@ -137,8 +150,8 @@ if run_button:
             y_raw[mask, j] = 0.0
 
     # ── Auto-select lookback ──────────────────────────────────────────────────
-    lb_key    = make_cache_key(last_date_str, start_yr, fee_bps, int(epochs),
-                                split_option, False, 0)
+    lb_key = make_cache_key(last_date_str, start_yr, fee_bps, int(epochs),
+                            split_option, False, 0)
     lb_cached = load_cache(f"lb_{lb_key}")
 
     if lb_cached is not None:
@@ -151,35 +164,35 @@ if run_button:
                 train_pct, val_pct, n_classes,
                 candidates=[30, 45, 60],
             )
-        save_cache(f"lb_{lb_key}", {"optimal_lookback": optimal_lookback})
-        st.success(f"📐 Optimal lookback: **{optimal_lookback}d** (auto-selected from 30/45/60)")
+            save_cache(f"lb_{lb_key}", {"optimal_lookback": optimal_lookback})
+            st.success(f"📐 Optimal lookback: **{optimal_lookback}d** (auto-selected from 30/45/60)")
 
     lookback = optimal_lookback
 
     # ── Check model cache ─────────────────────────────────────────────────────
-    cache_key   = make_cache_key(last_date_str, start_yr, fee_bps, int(epochs),
-                                  split_option, False, lookback)
+    cache_key = make_cache_key(last_date_str, start_yr, fee_bps, int(epochs),
+                               split_option, False, lookback)
     cached_data = load_cache(cache_key)
 
     if cached_data is not None:
-        results      = cached_data["results"]
+        results = cached_data["results"]
         trained_info = cached_data["trained_info"]
-        test_dates   = pd.DatetimeIndex(cached_data["test_dates"])
-        test_slice   = cached_data["test_slice"]
+        test_dates = pd.DatetimeIndex(cached_data["test_dates"])
+        test_slice = cached_data["test_slice"]
         st.success("⚡ Results loaded from cache — no retraining needed.")
     else:
         X_seq, y_seq = build_sequences(X_raw, y_raw, lookback)
-        y_labels     = returns_to_labels(y_seq)
+        y_labels = returns_to_labels(y_seq)
 
         (X_train, y_train_r, X_val, y_val_r,
-         X_test,  y_test_r)  = train_val_test_split(X_seq, y_seq,    train_pct, val_pct)
-        (_,       y_train_l,  _,    y_val_l,
-         _,       _)         = train_val_test_split(X_seq, y_labels, train_pct, val_pct)
+         X_test, y_test_r) = train_val_test_split(X_seq, y_seq, train_pct, val_pct)
+        (_, y_train_l, _, y_val_l,
+         _, _) = train_val_test_split(X_seq, y_labels, train_pct, val_pct)
 
         X_train_s, X_val_s, X_test_s, _ = scale_features(X_train, X_val, X_test)
 
         train_size = len(X_train)
-        val_size   = len(X_val)
+        val_size = len(X_val)
         test_start = lookback + train_size + val_size
         test_dates = df.index[test_start: test_start + len(X_test)]
         test_slice = slice(test_start, test_start + len(X_test))
@@ -199,14 +212,14 @@ if run_button:
                                      val_size=val_size, n_classes=n_classes,
                                      epochs=int(epochs)),
              lambda m: predict_approach2(m[0], X_test_s, X_raw, m[3], m[2],
-                                          lookback, train_size, val_size)),
+                                         lookback, train_size, val_size)),
             ("Approach 3",
              lambda: train_approach3(X_train_s, y_train_l, X_val_s, y_val_l,
                                      n_classes=n_classes, epochs=int(epochs)),
              lambda m: predict_approach3(m[0], X_test_s)),
         ]:
             try:
-                model_out    = train_fn()
+                model_out = train_fn()
                 preds, proba = predict_fn(model_out)
                 results[approach] = execute_strategy(
                     preds, proba, y_test_r, test_dates,
@@ -246,17 +259,17 @@ with tab_single:
         st.info("👈 Configure parameters and click **🚀 Run All 3 Approaches**.")
         st.stop()
 
-    results          = st.session_state.results
-    trained_info     = st.session_state.trained_info
-    test_dates       = st.session_state.test_dates
-    test_slice       = st.session_state.test_slice
+    results = st.session_state.results
+    trained_info = st.session_state.trained_info
+    test_dates = st.session_state.test_dates
+    test_slice = st.session_state.test_slice
     optimal_lookback = st.session_state.optimal_lookback
-    df               = st.session_state.df_for_chart
-    tbill_rate       = st.session_state.tbill_rate
-    target_etfs      = st.session_state.target_etfs
+    df = st.session_state.df_for_chart
+    tbill_rate = st.session_state.tbill_rate
+    target_etfs = st.session_state.target_etfs
 
     winner_name = select_winner(results)
-    winner_res  = results.get(winner_name)
+    winner_res = results.get(winner_name)
 
     if winner_res is None:
         st.error("❌ All approaches failed.")
@@ -270,14 +283,14 @@ with tab_single:
     show_signal_banner(winner_res["next_signal"], next_date, winner_name)
 
     winner_proba = trained_info[winner_name]["proba"]
-    conviction   = compute_conviction(winner_proba[-1], target_etfs, include_cash=False)
+    conviction = compute_conviction(winner_proba[-1], target_etfs, include_cash=False)
     show_conviction_panel(conviction)
 
     st.divider()
 
     all_signals = {
         name: {"signal": res["next_signal"],
-               "proba":  trained_info[name]["proba"][-1],
+               "proba": trained_info[name]["proba"][-1],
                "is_winner": name == winner_name}
         for name, res in results.items() if res is not None
     }
@@ -304,7 +317,6 @@ with tab_single:
     st.divider()
     st.subheader(f"📋 Audit Trail — {winner_name} (Last 20 Trading Days)")
     show_audit_trail(winner_res["audit_trail"])
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — Multi-Year Consensus Sweep
@@ -361,17 +373,17 @@ with tab_sweep:
     if sweep_button:
         st.session_state.multiyear_ready = False
         sweep_results = run_multiyear_sweep(
-            df_raw         = df_raw,
-            sweep_years    = SWEEP_YEARS,
-            fee_bps        = fee_bps,
-            epochs         = int(epochs),
-            split_option   = split_option,
-            last_date_str  = last_date_str,
-            train_pct      = train_pct,
-            val_pct        = val_pct,
+            df_raw = df_raw,
+            sweep_years = SWEEP_YEARS,
+            fee_bps = fee_bps,
+            epochs = int(epochs),
+            split_option = split_option,
+            last_date_str = last_date_str,
+            train_pct = train_pct,
+            val_pct = val_pct,
         )
         st.session_state.multiyear_results = sweep_results
-        st.session_state.multiyear_ready   = True
+        st.session_state.multiyear_ready = True
 
     if st.session_state.multiyear_ready and st.session_state.multiyear_results:
         show_multiyear_results(
