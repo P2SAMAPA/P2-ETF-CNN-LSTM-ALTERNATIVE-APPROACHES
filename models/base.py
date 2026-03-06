@@ -71,18 +71,40 @@ def build_sequences(features, targets, lookback):
 
 def train_val_test_split(X, y, train_pct=0.70, val_pct=0.15):
 	n  = len(X)
+	if n == 0:
+		raise ValueError("Cannot split empty array. Data may be too small for the selected lookback and date range.")
 	t1 = int(n * train_pct)
 	t2 = int(n * (train_pct + val_pct))
+	# Ensure at least 1 sample in each split if possible
+	if t1 == 0 or t2 == t1 or n == t2:
+		raise ValueError(f"Insufficient data for split: n={n}, train_end={t1}, val_end={t2}. Try smaller lookback or larger date range.")
 	return X[:t1], y[:t1], X[t1:t2], y[t1:t2], X[t2:], y[t2:]
 
 
 # ── Feature scaling ───────────────────────────────────────────────────────────
 
 def scale_features(X_train, X_val, X_test):
+	# Handle edge cases where arrays might be empty or wrong dimensions
+	if X_train.size == 0:
+		raise ValueError("X_train is empty. Cannot scale features.")
+	
+	# Ensure 3D shape (samples, timesteps, features)
+	if X_train.ndim == 2:
+		# If 2D, assume (samples, features) and add time dimension
+		X_train = X_train.reshape(X_train.shape[0], 1, X_train.shape[1])
+		if X_val.size > 0:
+			X_val = X_val.reshape(X_val.shape[0], 1, X_val.shape[1])
+		if X_test.size > 0:
+			X_test = X_test.reshape(X_test.shape[0], 1, X_test.shape[1])
+	elif X_train.ndim != 3:
+		raise ValueError(f"Expected 2D or 3D X_train, got shape {X_train.shape}")
+	
 	n_feat = X_train.shape[2]
 	scaler = RobustScaler()
 	scaler.fit(X_train.reshape(-1, n_feat))
 	def _t(X):
+		if X.size == 0:
+			return X
 		s = X.shape
 		return scaler.transform(X.reshape(-1, n_feat)).reshape(s)
 	return _t(X_train), _t(X_val), _t(X_test), scaler
