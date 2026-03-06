@@ -105,27 +105,27 @@ with st.sidebar:
 if run_button:
     st.session_state.output_ready = False
 
-    # CRITICAL FIX: Keep extra history for feature engineering (252 days for z-scores + 21 for lags)
-    # Then filter to actual start year AFTER feature engineering
-    min_date_for_features = pd.Timestamp(f"{start_yr}-01-01") - pd.Timedelta(days=400)
-    df_full = df_raw[df_raw.index >= min_date_for_features].copy()
-
-    st.write(f"📅 **Data:** {df_full.index[0].strftime('%Y-%m-%d')} → {df_full.index[-1].strftime('%Y-%m-%d')} "
-             f"({df_full.index[-1].year - df_full.index[0].year + 1} years)")
-
+    # Keep full dataset for feature engineering (features need historical data)
+    # Filter to start year only after feature engineering
     try:
-        input_features, target_etfs, tbill_rate, df_processed, _ = get_features_and_targets(df_full)
+        input_features, target_etfs, tbill_rate, df_processed, _ = get_features_and_targets(df_raw)
     except ValueError as e:
         st.error(str(e))
+        st.stop()
+
+    # Check if df_processed is empty
+    if df_processed.empty:
+        st.error("Feature engineering resulted in empty dataset. Check data quality.")
         st.stop()
 
     # NOW filter to actual start year after features are calculated
     df = df_processed[df_processed.index.year >= start_yr].copy()
 
     if len(df) == 0:
+        available_years = sorted(df_processed.index.year.unique())
         st.error(f"No data available from {start_yr} onwards after feature engineering. "
-                 f"Latest available: {df_processed.index[-1].strftime('%Y-%m-%d')}. "
-                 f"Try an earlier start year.")
+                 f"Available years: {available_years[0]}-{available_years[-1]}. "
+                 f"Try an earlier start year or check dataset.")
         st.stop()
 
     n_etfs = len(target_etfs)
@@ -134,11 +134,17 @@ if run_button:
     st.info(
         f"🎯 **Targets:** {', '.join([t.replace('_Ret','') for t in target_etfs])} · "
         f"**Features:** {len(input_features)} signals · "
-        f"**T-bill:** {tbill_rate*100:.2f}%"
+        f"**T-bill:** {tbill_rate*100:.2f}% · "
+        f"**Period:** {df.index[0].strftime('%Y-%m-%d')} to {df.index[-1].strftime('%Y-%m-%d')}"
     )
 
     X_raw = df[input_features].values.astype(np.float32)
     y_raw = np.clip(df[target_etfs].values.astype(np.float32), -0.5, 0.5)
+
+    # Check for empty arrays
+    if len(X_raw) == 0 or len(y_raw) == 0:
+        st.error("Empty feature or target arrays after filtering. Check data range.")
+        st.stop()
 
     for j in range(X_raw.shape[1]):
         mask = np.isnan(X_raw[:, j])
