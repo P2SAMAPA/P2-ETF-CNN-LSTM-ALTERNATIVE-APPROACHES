@@ -91,8 +91,20 @@ def scale_features(X_train, X_val, X_test):
 # ── Label builder (no CASH class — CASH is a risk overlay) ───────────────────
 
 def returns_to_labels(y_raw):
-    """Simple argmax — model always predicts one of the ETFs."""
-    return np.argmax(y_raw, axis=1).astype(np.int32)
+     """Simple argmax — model always predicts one of the ETFs.
+    
+    Handles both 1D integer labels (returns as-is) and 
+    2D one-hot/probability arrays (converts via argmax).
+    """
+    y_raw = np.asarray(y_raw)
+    if y_raw.ndim == 1:
+        # Already integer labels (from build_sequences when targets is 1D per timestep)
+        return y_raw.astype(np.int32)
+    elif y_raw.ndim == 2:
+        # One-hot encoded or probability distribution across classes
+        return np.argmax(y_raw, axis=1).astype(np.int32)
+    else:
+        raise ValueError(f"Expected 1D or 2D array, got shape {y_raw.shape}")
 
 
 # ── Class weights ─────────────────────────────────────────────────────────────
