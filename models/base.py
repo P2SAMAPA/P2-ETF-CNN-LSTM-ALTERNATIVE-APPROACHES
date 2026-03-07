@@ -79,14 +79,28 @@ def train_val_test_split(X, y, train_pct=0.70, val_pct=0.15):
 # ── Feature scaling ───────────────────────────────────────────────────────────
 
 def scale_features(X_train, X_val, X_test):
-	# Handle edge case where arrays might be 2D instead of 3D
+	# Ensure X_train is at least 2D
+	if X_train.ndim == 1:
+		# Single sample with multiple features: (features,) -> (1, features)
+		X_train = X_train.reshape(1, -1)
+	
+	# Handle 2D case: (samples, features) -> (samples, 1, features)
 	if X_train.ndim == 2:
-		# Add time dimension: (samples, features) -> (samples, 1, features)
 		X_train = X_train.reshape(X_train.shape[0], 1, X_train.shape[1])
-		if X_val.size > 0:
-			X_val = X_val.reshape(X_val.shape[0], 1, X_val.shape[1])
-		if X_test.size > 0:
-			X_test = X_test.reshape(X_test.shape[0], 1, X_test.shape[1])
+		if X_val.size > 0 and X_val.ndim >= 2:
+			if X_val.ndim == 2:
+				X_val = X_val.reshape(X_val.shape[0], 1, X_val.shape[1])
+			elif X_val.ndim == 1:
+				X_val = X_val.reshape(1, 1, -1)
+		if X_test.size > 0 and X_test.ndim >= 2:
+			if X_test.ndim == 2:
+				X_test = X_test.reshape(X_test.shape[0], 1, X_test.shape[1])
+			elif X_test.ndim == 1:
+				X_test = X_test.reshape(1, 1, -1)
+	
+	# Final safety check
+	if X_train.ndim != 3:
+		raise ValueError(f"X_train must be 3D after reshaping, got shape {X_train.shape} with ndim={X_train.ndim}")
 	
 	n_feat = X_train.shape[2]
 	scaler = RobustScaler()
