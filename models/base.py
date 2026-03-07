@@ -79,10 +79,21 @@ def train_val_test_split(X, y, train_pct=0.70, val_pct=0.15):
 # ── Feature scaling ───────────────────────────────────────────────────────────
 
 def scale_features(X_train, X_val, X_test):
+	# Handle edge case where arrays might be 2D instead of 3D
+	if X_train.ndim == 2:
+		# Add time dimension: (samples, features) -> (samples, 1, features)
+		X_train = X_train.reshape(X_train.shape[0], 1, X_train.shape[1])
+		if X_val.size > 0:
+			X_val = X_val.reshape(X_val.shape[0], 1, X_val.shape[1])
+		if X_test.size > 0:
+			X_test = X_test.reshape(X_test.shape[0], 1, X_test.shape[1])
+	
 	n_feat = X_train.shape[2]
 	scaler = RobustScaler()
 	scaler.fit(X_train.reshape(-1, n_feat))
 	def _t(X):
+		if X.size == 0:
+			return X
 		s = X.shape
 		return scaler.transform(X.reshape(-1, n_feat)).reshape(s)
 	return _t(X_train), _t(X_val), _t(X_test), scaler
