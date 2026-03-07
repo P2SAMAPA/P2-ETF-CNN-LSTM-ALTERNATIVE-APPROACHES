@@ -106,8 +106,9 @@ if run_button:
 	st.session_state.output_ready = False
 
 	df = df_raw[df_raw.index.year >= start_yr].copy()
+	n_rows = len(df)
 	st.write(f"📅 **Data:** {df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')} "
-			 f"({df.index[-1].year - df.index[0].year + 1} years)")
+			 f"({df.index[-1].year - df.index[0].year + 1} years, {n_rows} rows)")
 
 	try:
 		input_features, target_etfs, tbill_rate, df, _ = get_features_and_targets(df)
@@ -121,7 +122,8 @@ if run_button:
 	st.info(
 		f"🎯 **Targets:** {', '.join([t.replace('_Ret','') for t in target_etfs])} · "
 		f"**Features:** {len(input_features)} signals · "
-		f"**T-bill:** {tbill_rate*100:.2f}%"
+		f"**T-bill:** {tbill_rate*100:.2f}%  · "
+		f"**Rows after feature engineering:** {len(df)}"
 	)
 
 	X_raw = df[input_features].values.astype(np.float32)
@@ -146,11 +148,18 @@ if run_button:
 		st.success(f"⚡ Cache hit · Optimal lookback: **{optimal_lookback}d**")
 	else:
 		with st.spinner("🔍 Auto-selecting optimal lookback (30 / 45 / 60d)..."):
-			optimal_lookback = find_best_lookback(
-				X_raw, y_raw,
-				train_pct, val_pct, n_classes,
-				candidates=[30, 45, 60],
-			)
+			try:
+				optimal_lookback = find_best_lookback(
+					X_raw, y_raw,
+					train_pct, val_pct, n_classes,
+					candidates=[30, 45, 60],
+				)
+			except ValueError as e:
+				st.error(
+					f"❌ Could not find a valid lookback window.\n\n{e}\n\n"
+					f"**Try an earlier Start Year** (e.g. 2013 or earlier)."
+				)
+				st.stop()
 			save_cache(f"lb_{lb_key}", {"optimal_lookback": optimal_lookback})
 			st.success(f"📐 Optimal lookback: **{optimal_lookback}d** (auto-selected from 30/45/60)")
 
@@ -175,6 +184,35 @@ if run_button:
 		 X_test, y_test_r) = train_val_test_split(X_seq, y_seq, train_pct, val_pct)
 		(_, y_train_l, _, y_val_l,
 		 _, _) = train_val_test_split(X_seq, y_labels, train_pct, val_pct)
+
+		# ── Guard: detect empty splits BEFORE calling scale_features ─────────
+		# Root cause of "cannot reshape array of size 0 into shape (0,n_feat)":
+		# When start_yr is too recent, feature engineering + lookback window
+		# consume most rows, leaving X_train empty. scale_features then calls
+		# X_train.reshape(-1, n_feat) on a size-0 array → cryptic crash.
+		# We catch it here and give the user a clear, actionable message.
+		n_seq = len(X_seq)
+		if len(X_train) == 0:
+			st.error(
+				f"❌ **Training set is empty** after applying lookback={lookback}d "
+				f"to {n_seq} sequences from {len(df)} rows.\n\n"
+				f"**Start Year {start_yr}** is too recent — not enough history remains "
+				f"after the {lookback}-day lookback window and {int(train_pct*100)}% "
+				f"train split. **Try Start Year 2013 or earlier.**"
+			)
+			st.stop()
+		if len(X_val) == 0:
+			st.error(
+				f"❌ **Validation set is empty** ({n_seq} sequences, "
+				f"train_pct={train_pct}). Try an earlier Start Year."
+			)
+			st.stop()
+		if len(X_test) == 0:
+			st.error(
+				f"❌ **Test set is empty** — not enough data for held-out evaluation. "
+				f"Try an earlier Start Year."
+			)
+			st.stop()
 
 		X_train_s, X_val_s, X_test_s, _ = scale_features(X_train, X_val, X_test)
 
@@ -319,11 +357,9 @@ with tab_sweep:
 
 	SWEEP_YEARS = [2010, 2012, 2014, 2016, 2018, 2019, 2021, 2023]
 
-	# ── Freshness check ───────────────────────────────────────────────────────
 	from datetime import datetime as _dt, timezone as _tz, timedelta as _td
 	today_est = (_dt.now(_tz.utc) - _td(hours=5)).strftime("%Y-%m-%d")
 
-	# Detect if current session results are stale (from a different data date)
 	cached_results = st.session_state.get("multiyear_results")
 	cached_data_date = None
 	if cached_results:
@@ -360,14 +396,14 @@ with tab_sweep:
 	if sweep_button:
 		st.session_state.multiyear_ready = False
 		sweep_results = run_multiyear_sweep(
-			df_raw = df_raw,
-			sweep_years = SWEEP_YEARS,
-			fee_bps = fee_bps,
-			epochs = int(epochs),
-			split_option = split_option,
-			last_date_str = last_date_str,
-			train_pct = train_pct,
-			val_pct = val_pct,
+			df_raw=df_raw,
+			sweep_years=SWEEP_YEARS,
+			fee_bps=fee_bps,
+			epochs=int(epochs),
+			split_option=split_option,
+			last_date_str=last_date_str,
+			train_pct=train_pct,
+			val_pct=val_pct,
 		)
 		st.session_state.multiyear_results = sweep_results
 		st.session_state.multiyear_ready = True
@@ -375,7 +411,7 @@ with tab_sweep:
 	if st.session_state.multiyear_ready and st.session_state.multiyear_results:
 		show_multiyear_results(
 			st.session_state.multiyear_results,
-			sweep_years = SWEEP_YEARS,
+			sweep_years=SWEEP_YEARS,
 		)
 	elif not st.session_state.multiyear_ready:
 		st.info("Click **🚀 Run Consensus Sweep** to analyse all start years at once.")
