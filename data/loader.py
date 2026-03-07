@@ -60,7 +60,8 @@ def load_dataset(hf_token: str) -> pd.DataFrame:
 		)
 		df = pd.read_parquet(path)
 		if not isinstance(df.index, pd.DatetimeIndex):
-			for col in ["Date", "date", "DATE"]:
+			# Check common date column names including parquet-exported index
+			for col in ["Date", "date", "DATE", "__index_level_0__"]:
 				if col in df.columns:
 					df = df.set_index(col)
 					break
