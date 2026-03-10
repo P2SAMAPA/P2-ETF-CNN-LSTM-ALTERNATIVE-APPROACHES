@@ -8,7 +8,8 @@ P2-ETF-CNN-LSTM-ALTERNATIVE-APPROACHES
 - Ann. Return compared vs SPY in metrics row
 - Max Daily DD shows date it occurred
 - Conviction panel: compact ETF probability list
-- [NEW] Multi-Year Sweep tab: runs 8 start years, vote tally + comparison table
+- Multi-Year Sweep tab: runs 8 start years, vote tally + comparison table
+- [NEW] Force Retrain button in sweep tab bypasses cache and retrains from scratch
 """
 
 import os
@@ -185,12 +186,6 @@ if run_button:
 		(_, y_train_l, _, y_val_l,
 		 _, _) = train_val_test_split(X_seq, y_labels, train_pct, val_pct)
 
-		# ── Guard: detect empty splits BEFORE calling scale_features ─────────
-		# Root cause of "cannot reshape array of size 0 into shape (0,n_feat)":
-		# When start_yr is too recent, feature engineering + lookback window
-		# consume most rows, leaving X_train empty. scale_features then calls
-		# X_train.reshape(-1, n_feat) on a size-0 array → cryptic crash.
-		# We catch it here and give the user a clear, actionable message.
 		n_seq = len(X_seq)
 		if len(X_train) == 0:
 			st.error(
@@ -382,18 +377,53 @@ with tab_sweep:
 	elif cached_data_date:
 		st.success(f"✅ Results current — data as of **{last_date_str}**", icon="📅")
 
-	col_l, col_r = st.columns([2, 1])
-	with col_l:
-		st.caption(f"Sweep years: {', '.join(str(y) for y in SWEEP_YEARS)} · Data date: {last_date_str}")
-	with col_r:
+	# ── Action buttons row ────────────────────────────────────────────────────
+	col_info, col_run, col_force = st.columns([2, 1, 1])
+
+	with col_info:
+		st.caption(
+			f"Sweep years: {', '.join(str(y) for y in SWEEP_YEARS)} · "
+			f"Data date: {last_date_str}"
+		)
+
+	with col_run:
 		sweep_button = st.button(
 			"🚀 Run Consensus Sweep",
 			type="primary",
 			use_container_width=True,
-			help="Re-runs if data has updated since last sweep"
+			help="Runs sweep — uses cache where available, retrains stale years only.",
 		)
 
-	if sweep_button:
+	with col_force:
+		force_retrain_button = st.button(
+			"🔄 Force Retrain All",
+			type="secondary",
+			use_container_width=True,
+			help="Clears all cached sweep results and retrains every year from scratch. "
+			     "Use when you want fully fresh signals regardless of cache.",
+		)
+
+	# ── Handle Force Retrain ──────────────────────────────────────────────────
+	if force_retrain_button:
+		st.session_state.multiyear_ready   = False
+		st.session_state.multiyear_results = None
+		st.info("🗑️ Sweep cache cleared — retraining all years from scratch…")
+		sweep_results = run_multiyear_sweep(
+			df_raw=df_raw,
+			sweep_years=SWEEP_YEARS,
+			fee_bps=fee_bps,
+			epochs=int(epochs),
+			split_option=split_option,
+			last_date_str=last_date_str,
+			train_pct=train_pct,
+			val_pct=val_pct,
+			force_retrain=True,          # ← bypass cache entirely
+		)
+		st.session_state.multiyear_results = sweep_results
+		st.session_state.multiyear_ready   = True
+
+	# ── Handle normal Run ─────────────────────────────────────────────────────
+	elif sweep_button:
 		st.session_state.multiyear_ready = False
 		sweep_results = run_multiyear_sweep(
 			df_raw=df_raw,
@@ -404,10 +434,12 @@ with tab_sweep:
 			last_date_str=last_date_str,
 			train_pct=train_pct,
 			val_pct=val_pct,
+			force_retrain=False,         # ← use cache where available
 		)
 		st.session_state.multiyear_results = sweep_results
-		st.session_state.multiyear_ready = True
+		st.session_state.multiyear_ready   = True
 
+	# ── Display results ───────────────────────────────────────────────────────
 	if st.session_state.multiyear_ready and st.session_state.multiyear_results:
 		show_multiyear_results(
 			st.session_state.multiyear_results,
