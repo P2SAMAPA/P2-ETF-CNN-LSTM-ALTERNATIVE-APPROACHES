@@ -9,6 +9,7 @@ Design principles:
   sensitive to start-year choice, and typically the winner)
 - Each year runs independently; failures are soft (skipped with a warning)
 - Results are shown as: (1) vote tally bar chart, (2) full per-year table
+- [NEW] force_retrain=True bypasses all cache and retrains every year fresh
 """
 
 import streamlit as st
@@ -56,6 +57,7 @@ def run_multiyear_sweep(
     last_date_str: str,
     train_pct:     float,
     val_pct:       float,
+    force_retrain: bool = False,
 ) -> list:
     """
     For each year in sweep_years, train/load Approach 2 and collect:
@@ -65,16 +67,27 @@ def run_multiyear_sweep(
       - lookback used
       - whether result came from cache
 
+    Parameters
+    ----------
+    force_retrain : bool
+        When True, completely ignores all existing cache entries and retrains
+        every year from scratch. Fresh results are still saved to cache so
+        subsequent normal runs can use them.
+        When False (default), loads from cache wherever available.
+
     Returns list of dicts, one per year (None-safe).
     """
     sweep_results = []
     progress_bar  = st.progress(0, text="Starting sweep...")
     status_area   = st.empty()
 
+    if force_retrain:
+        st.caption("🔄 Force retrain mode — ignoring all cached results, training from scratch.")
+
     for idx, yr in enumerate(sweep_years):
         pct  = int((idx / len(sweep_years)) * 100)
         progress_bar.progress(pct, text=f"Processing start year {yr}…")
-        status_area.info(f"🔄 Year {yr} ({idx+1}/{len(sweep_years)})")
+        status_area.info(f"{'🔄 Retraining' if force_retrain else '🔍 Loading'} year {yr} ({idx+1}/{len(sweep_years)})")
 
         row = {"start_year": yr, "signal": None, "z_score": None,
                "conviction": None, "ann_return": None, "sharpe": None,
@@ -105,9 +118,11 @@ def run_multiyear_sweep(
                     y_raw[mask, j] = 0.0
 
             # ── Lookback ──────────────────────────────────────────────────────
+            # force_retrain also clears lookback cache so we get a fresh
+            # auto-selection rather than a potentially stale window choice
             lb_key    = make_cache_key(last_date_str, yr, fee_bps, epochs,
                                        split_option, False, 0)
-            lb_cached = load_cache(f"lb_{lb_key}")
+            lb_cached = None if force_retrain else load_cache(f"lb_{lb_key}")
 
             if lb_cached is not None:
                 optimal_lookback = lb_cached["optimal_lookback"]
@@ -122,19 +137,22 @@ def run_multiyear_sweep(
             row["lookback"] = lookback
 
             # ── Model cache ───────────────────────────────────────────────────
-            # Use a sweep-specific cache key so it doesn't clash with 3-approach runs
+            # Use a sweep-specific cache key so it doesn't clash with 3-approach runs.
+            # force_retrain=True → skip load_cache entirely; still save at the end
+            # so subsequent normal runs benefit from the fresh result.
             cache_key   = make_cache_key(
                 f"sweep2_{last_date_str}", yr, fee_bps, epochs,
                 split_option, False, lookback
             )
-            cached_data = load_cache(cache_key)
+            cached_data = None if force_retrain else load_cache(cache_key)
 
             if cached_data is not None:
-                result   = cached_data["result"]
-                proba    = cached_data["proba"]
+                result          = cached_data["result"]
+                proba           = cached_data["proba"]
                 row["from_cache"] = True
                 row["run_date"]   = cached_data.get("run_date", last_date_str)
             else:
+                # ── Full retrain ──────────────────────────────────────────────
                 X_seq, y_seq = build_sequences(X_raw, y_raw, lookback)
                 y_labels     = returns_to_labels(y_seq)
 
@@ -164,9 +182,19 @@ def run_multiyear_sweep(
                     preds, proba, y_test_r, test_dates,
                     target_etfs, fee_bps, tbill_rate,
                 )
+
                 from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td2
                 _run_date = (_dt2.now(_tz2.utc) - _td2(hours=5)).strftime("%Y-%m-%d")
-                save_cache(cache_key, {"result": result, "proba": proba, "run_date": _run_date})
+
+                # Always save to cache (even after force retrain) so the next
+                # normal run can use these fresh results without retraining again
+                save_cache(cache_key, {
+                    "result":   result,
+                    "proba":    proba,
+                    "run_date": _run_date,
+                })
+
+                row["from_cache"] = False   # freshly trained this run
 
             # ── Conviction ────────────────────────────────────────────────────
             conviction = compute_conviction(proba[-1], target_etfs, include_cash=False)
@@ -227,7 +255,6 @@ def _compute_weighted_scores(valid: list) -> list:
     returns = [r["ann_return"] if r["ann_return"] is not None else 0.0 for r in valid]
     zscores = [r["z_score"]    if r["z_score"]    is not None else 0.0 for r in valid]
     sharpes = [r["sharpe"]     if r["sharpe"]     is not None else 0.0 for r in valid]
-    # For drawdown: less negative is better → negate so higher = better
     dds     = [-(r["max_dd"]   if r["max_dd"]     is not None else -1.0) for r in valid]
 
     n_ret = _minmax(returns)
@@ -259,8 +286,6 @@ def _compute_weighted_scores(valid: list) -> list:
 def _vote_tally_chart(scored: list) -> go.Figure:
     """
     Bar chart: weighted score accumulated per ETF across all start years.
-    Each year contributes its composite score to its predicted ETF's total.
-    The bar height = sum of weighted scores (not raw vote count).
     """
     from collections import defaultdict
     etf_scores = defaultdict(float)
@@ -271,12 +296,12 @@ def _vote_tally_chart(scored: list) -> go.Figure:
         etf_scores[etf] += r["weighted_score"]
         etf_counts[etf] += 1
 
-    etfs   = sorted(etf_scores.keys(), key=lambda e: -etf_scores[e])
-    values = [etf_scores[e] for e in etfs]
-    counts = [etf_counts[e] for e in etfs]
-    colors = [_etf_colour(e) for e in etfs]
+    etfs        = sorted(etf_scores.keys(), key=lambda e: -etf_scores[e])
+    values      = [etf_scores[e] for e in etfs]
+    counts      = [etf_counts[e] for e in etfs]
+    colors      = [_etf_colour(e) for e in etfs]
     total_score = sum(values)
-    pcts   = [f"{v/total_score*100:.0f}%" for v in values]
+    pcts        = [f"{v/total_score*100:.0f}%" for v in values]
 
     fig = go.Figure(go.Bar(
         x=etfs,
@@ -311,14 +336,7 @@ def _conviction_scatter(sweep_results: list) -> go.Figure:
     if not valid:
         return None
 
-    years   = [r["start_year"] for r in valid]
-    zscores = [r["z_score"]    for r in valid]
-    signals = [r["signal"]     for r in valid]
-    colors  = [_etf_colour(s)  for s in signals]
-
     fig = go.Figure()
-
-    # One trace per unique ETF so we get a legend
     seen = set()
     for r in valid:
         etf = r["signal"]
@@ -337,10 +355,8 @@ def _conviction_scatter(sweep_results: list) -> go.Figure:
                           line=dict(color="white", width=1.5)),
         ))
 
-    # Neutral line
     fig.add_hline(y=0, line_dash="dot", line_color="rgba(255,255,255,0.3)",
                   annotation_text="Neutral 0σ", annotation_position="right")
-
     fig.update_layout(
         template="plotly_dark",
         height=320,
@@ -359,17 +375,17 @@ def _build_full_table(scored: list) -> pd.DataFrame:
     for r in scored:
         if r.get("error"):
             rows.append({
-                "Start Year":    r["start_year"],
-                "Signal":        "ERROR",
-                "Wtd Score":     "—",
-                "Conviction":    "—",
-                "Z-Score":       "—",
-                "Ann. Return":   "—",
-                "Sharpe":        "—",
-                "Max Drawdown":  "—",
-                "Lookback":      "—",
-                "Cache":         "—",
-                "Note":          r["error"][:40],
+                "Start Year":   r["start_year"],
+                "Signal":       "ERROR",
+                "Wtd Score":    "—",
+                "Conviction":   "—",
+                "Z-Score":      "—",
+                "Ann. Return":  "—",
+                "Sharpe":       "—",
+                "Max Drawdown": "—",
+                "Lookback":     "—",
+                "Cache":        "—",
+                "Note":         r["error"][:40],
             })
         else:
             ws = r.get("weighted_score")
@@ -378,7 +394,7 @@ def _build_full_table(scored: list) -> pd.DataFrame:
                 "Signal":       r["signal"]      or "—",
                 "Wtd Score":    f"{ws:.3f}"       if ws   is not None else "—",
                 "Conviction":   r["conviction"]  or "—",
-                "Z-Score":      f"{r['z_score']:.2f}σ"    if r["z_score"]    is not None else "—",
+                "Z-Score":      f"{r['z_score']:.2f}σ"       if r["z_score"]    is not None else "—",
                 "Ann. Return":  f"{r['ann_return']*100:.2f}%" if r["ann_return"] is not None else "—",
                 "Sharpe":       f"{r['sharpe']:.2f}"          if r["sharpe"]     is not None else "—",
                 "Max Drawdown": f"{r['max_dd']*100:.2f}%"     if r["max_dd"]     is not None else "—",
@@ -392,7 +408,6 @@ def _build_full_table(scored: list) -> pd.DataFrame:
 def _consensus_banner(scored: list, run_date_str: str = ""):
     """
     Show the consensus signal selected by highest cumulative weighted score.
-    Also shows vote count and avg weighted score for context.
     """
     if not scored:
         st.warning("No valid signals collected.")
@@ -406,18 +421,14 @@ def _consensus_banner(scored: list, run_date_str: str = ""):
         etf_total_score[etf] += r["weighted_score"]
         etf_counts[etf]      += 1
 
-    # Winner = highest cumulative weighted score
     top_signal  = max(etf_total_score, key=lambda e: etf_total_score[e])
     top_score   = etf_total_score[top_signal]
     total_score = sum(etf_total_score.values())
     score_pct   = top_score / total_score * 100
     top_votes   = etf_counts[top_signal]
     total_years = len(scored)
+    avg_ws      = top_score / top_votes
 
-    # Avg weighted score of the winning ETF's years
-    avg_ws = top_score / top_votes
-
-    # Strength label based on score share
     if score_pct >= 60:
         strength, bg = "🔥 Strong Consensus", "linear-gradient(135deg,#00b894,#00cec9)"
     elif score_pct >= 40:
@@ -425,7 +436,6 @@ def _consensus_banner(scored: list, run_date_str: str = ""):
     else:
         strength, bg = "⚠️ Split Signal",      "linear-gradient(135deg,#636e72,#2d3436)"
 
-    # Avg component breakdown for the winning ETF
     winners = [r for r in scored if r["signal"] == top_signal]
     avg_ret = np.mean([r["ann_return"] for r in winners if r["ann_return"] is not None]) * 100
     avg_z   = np.mean([r["z_score"]   for r in winners if r["z_score"]   is not None])
@@ -459,7 +469,6 @@ def _consensus_banner(scored: list, run_date_str: str = ""):
     </div>
     """, unsafe_allow_html=True)
 
-    # Runner-up ETFs by weighted score
     others = sorted(
         [(e, s) for e, s in etf_total_score.items() if e != top_signal],
         key=lambda x: -x[1]
@@ -494,27 +503,19 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
         st.error("No valid results from any start year.")
         return
 
-    # ── Compute weighted scores for all valid rows ────────────────────────────
-    scored = _compute_weighted_scores(valid)
-    # Merge scores back into full sweep_results (including failed rows)
+    scored       = _compute_weighted_scores(valid)
     scored_by_yr = {r["start_year"]: r for r in scored}
     full_scored  = [scored_by_yr.get(r["start_year"], r) for r in sweep_results]
 
-    # ── Consensus banner ──────────────────────────────────────────────────────
-    # Derive run_date from most recent result
-    run_dates = [r.get("run_date", "") for r in scored if r.get("run_date")]
+    run_dates    = [r.get("run_date", "") for r in scored if r.get("run_date")]
     run_date_str = max(run_dates) if run_dates else ""
     _consensus_banner(scored, run_date_str=run_date_str)
 
     st.divider()
 
-    # ── Charts row ────────────────────────────────────────────────────────────
     col_left, col_right = st.columns([1, 1])
-
     with col_left:
-        tally_fig = _vote_tally_chart(scored)
-        st.plotly_chart(tally_fig, use_container_width=True)
-
+        st.plotly_chart(_vote_tally_chart(scored), use_container_width=True)
     with col_right:
         scatter_fig = _conviction_scatter(scored)
         if scatter_fig:
@@ -522,7 +523,6 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
 
     st.divider()
 
-    # ── Full comparison table ─────────────────────────────────────────────────
     st.subheader("📋 Full Per-Year Breakdown")
     st.caption(
         "**Wtd Score** = 40% Ann. Return + 20% Z-Score + 20% Sharpe + 20% (−Max DD), "
@@ -541,7 +541,6 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
                 styles[list(df.columns).index("Signal")] = (
                     f"background-color: {col}22; color: {col}; font-weight: 700;"
                 )
-                # Highlight the Wtd Score cell too
                 if "Wtd Score" in df.columns:
                     styles[list(df.columns).index("Wtd Score")] = (
                         f"color: {col}; font-weight: 700;"
@@ -566,7 +565,6 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
 
     st.dataframe(_style_table(table_df), use_container_width=True, hide_index=True)
 
-    # ── How to read this ──────────────────────────────────────────────────────
     st.divider()
     st.subheader("📖 How to Read These Results")
     st.markdown("""
@@ -588,7 +586,7 @@ Each year's result gets a composite score (0–1) based on four normalised metri
 | Sharpe Ratio | **20%** | Higher and positive is better |
 | Max Drawdown | **20%** | Lower magnitude is better |
 
-The ETF with the highest **total cumulative score** across all start years wins. This means an ETF that scores well consistently beats one that wins by raw votes alone.
+The ETF with the highest **total cumulative score** across all start years wins.
 
 **Score share interpretation:**
 | Score share | Interpretation |
@@ -597,5 +595,11 @@ The ETF with the highest **total cumulative score** across all start years wins.
 | 40–60% | Majority signal — moderate confidence |
 | < 40% | Split signal — regime unstable, consider caution |
 
-> 💡 **Best practice:** Highest confidence when score share is high **and** the winning ETF also has above-average Z-scores across its years.
+**Force Retrain vs Run Consensus Sweep:**
+| Button | Behaviour |
+|---|---|
+| 🚀 Run Consensus Sweep | Uses cached results where available; only retrains years with no cache hit |
+| 🔄 Force Retrain All | Ignores all cache; retrains every year from scratch; saves fresh results to cache |
+
+> 💡 **Best practice:** Use **Run Consensus Sweep** daily (fast, cache-aware). Use **Force Retrain All** when you change epochs, fee, or split settings and want results that reflect the new configuration.
     """)
