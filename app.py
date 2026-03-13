@@ -344,10 +344,11 @@ with tab_single:
 with tab_sweep:
 	st.subheader("🔁 Multi-Year Consensus Sweep")
 	st.markdown(
-		"Runs the winner model (Approach 2 proxy) across **8 start years** "
-		"and aggregates signals into a consensus vote. "
-		"Each year uses the same fee, epochs, and split settings as the sidebar. "
-		"Results are cached per data date — cache auto-invalidates when new data arrives."
+    "Runs **all 3 approaches** across **8 start years**, picks the winner per year "
+    "(highest annualised return on test set — identical to Single-Year tab), "
+    "and aggregates signals into a weighted consensus vote. "
+    "Each year uses the same fee, epochs, and split settings as the sidebar. "
+    "Results are cached per data date — cache auto-invalidates when new data arrives."
 	)
 
 	SWEEP_YEARS = [2010, 2012, 2014, 2016, 2018, 2019, 2021, 2023]
