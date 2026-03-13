@@ -1,32 +1,36 @@
 """
 ui/multiyear.py
-Multi-Year Consensus Sweep — runs Approach 2 (regime-conditioned) across
-multiple start years and aggregates signals into a vote tally + comparison table.
+Multi-Year Consensus Sweep
+
+Each sweep year is run IDENTICALLY to the single-year tab:
+  - All 3 approaches trained (Wavelet, Regime-Conditioned, Multi-Scale)
+  - Winner selected by highest raw annualised return on out-of-sample test set
+  - Same cache key as app.py → free cache hits when single-year tab already ran that year
+  - Consensus votes on the per-year winner signal, scored by weighted metrics
 
 Design principles:
-- Reuses the existing cache wherever possible (no redundant retraining)
-- Only Approach 2 is used for the sweep (it's the regime-aware model, most
-  sensitive to start-year choice, and typically the winner)
-- Each year runs independently; failures are soft (skipped with a warning)
-- Results are shown as: (1) vote tally bar chart, (2) full per-year table
-- [NEW] force_retrain=True bypasses all cache and retrains every year fresh
+  - No divergence from single-year logic — sweep year 2019 == single-year start 2019
+  - Cache shared with app.py (identical key) so no redundant retraining
+  - force_retrain=True bypasses cache and retrains all years from scratch
+  - Failures are soft (year skipped with warning, others continue)
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from collections import Counter
+from collections import Counter, defaultdict
 
-from data.loader   import get_features_and_targets
-from models.base   import (build_sequences, train_val_test_split,
-                            scale_features, returns_to_labels,
-                            find_best_lookback, make_cache_key,
-                            save_cache, load_cache)
-from models.approach2_regime import train_approach2, predict_approach2
-from strategy.backtest       import execute_strategy, select_winner
-from signals.conviction      import compute_conviction
-
+from data.loader             import get_features_and_targets
+from models.base             import (build_sequences, train_val_test_split,
+                                     scale_features, returns_to_labels,
+                                     find_best_lookback, make_cache_key,
+                                     save_cache, load_cache)
+from models.approach1_wavelet    import train_approach1, predict_approach1
+from models.approach2_regime     import train_approach2, predict_approach2
+from models.approach3_multiscale import train_approach3, predict_approach3
+from strategy.backtest           import execute_strategy, select_winner
+from signals.conviction          import compute_conviction
 
 # ── ETF display colours ───────────────────────────────────────────────────────
 ETF_COLOURS = {
@@ -60,23 +64,26 @@ def run_multiyear_sweep(
     force_retrain: bool = False,
 ) -> list:
     """
-    For each year in sweep_years, train/load Approach 2 and collect:
-      - next_signal
-      - Z-score conviction
-      - ann_return, sharpe, max_dd
-      - lookback used
-      - whether result came from cache
+    For each year in sweep_years, run ALL 3 approaches exactly as app.py does,
+    pick the winner (highest annualised return on test set), and record its signal.
+
+    Cache key is IDENTICAL to app.py so results are shared — if the single-year
+    tab already ran year 2019, this sweep loads that cached result at zero cost.
 
     Parameters
     ----------
     force_retrain : bool
-        When True, completely ignores all existing cache entries and retrains
-        every year from scratch. Fresh results are still saved to cache so
-        subsequent normal runs can use them.
-        When False (default), loads from cache wherever available.
+        When True, ignores all cache and retrains every year from scratch.
+        Fresh results are saved to cache so subsequent normal runs are fast.
 
-    Returns list of dicts, one per year (None-safe).
+    Returns
+    -------
+    list of dicts, one per year, with keys:
+        start_year, signal, winner_approach, z_score, conviction,
+        ann_return, sharpe, max_dd, lookback, from_cache, error, run_date
     """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
     sweep_results = []
     progress_bar  = st.progress(0, text="Starting sweep...")
     status_area   = st.empty()
@@ -85,16 +92,30 @@ def run_multiyear_sweep(
         st.caption("🔄 Force retrain mode — ignoring all cached results, training from scratch.")
 
     for idx, yr in enumerate(sweep_years):
-        pct  = int((idx / len(sweep_years)) * 100)
+        pct = int((idx / len(sweep_years)) * 100)
         progress_bar.progress(pct, text=f"Processing start year {yr}…")
-        status_area.info(f"{'🔄 Retraining' if force_retrain else '🔍 Loading'} year {yr} ({idx+1}/{len(sweep_years)})")
+        status_area.info(
+            f"{'🔄 Retraining' if force_retrain else '🔍 Checking cache for'} "
+            f"year {yr} ({idx+1}/{len(sweep_years)})"
+        )
 
-        row = {"start_year": yr, "signal": None, "z_score": None,
-               "conviction": None, "ann_return": None, "sharpe": None,
-               "max_dd": None, "lookback": None, "from_cache": False,
-               "error": None}
+        row = {
+            "start_year":      yr,
+            "signal":          None,
+            "winner_approach": None,
+            "z_score":         None,
+            "conviction":      None,
+            "ann_return":      None,
+            "sharpe":          None,
+            "max_dd":          None,
+            "lookback":        None,
+            "from_cache":      False,
+            "error":           None,
+            "run_date":        None,
+        }
 
         try:
+            # ── Slice data identically to app.py ─────────────────────────────
             df = df_raw[df_raw.index.year >= yr].copy()
             if len(df) < 300:
                 row["error"] = "Insufficient data (<300 rows)"
@@ -108,6 +129,7 @@ def run_multiyear_sweep(
             X_raw = df[input_features].values.astype(np.float32)
             y_raw = np.clip(df[target_etfs].values.astype(np.float32), -0.5, 0.5)
 
+            # Impute NaNs — identical to app.py
             for j in range(X_raw.shape[1]):
                 mask = np.isnan(X_raw[:, j])
                 if mask.any():
@@ -117,9 +139,7 @@ def run_multiyear_sweep(
                 if mask.any():
                     y_raw[mask, j] = 0.0
 
-            # ── Lookback ──────────────────────────────────────────────────────
-            # force_retrain also clears lookback cache so we get a fresh
-            # auto-selection rather than a potentially stale window choice
+            # ── Lookback — same cache key as app.py (no sweep prefix) ─────────
             lb_key    = make_cache_key(last_date_str, yr, fee_bps, epochs,
                                        split_option, False, 0)
             lb_cached = None if force_retrain else load_cache(f"lb_{lb_key}")
@@ -133,26 +153,25 @@ def run_multiyear_sweep(
                 )
                 save_cache(f"lb_{lb_key}", {"optimal_lookback": optimal_lookback})
 
-            lookback = optimal_lookback
+            lookback       = optimal_lookback
             row["lookback"] = lookback
 
-            # ── Model cache ───────────────────────────────────────────────────
-            # Use a sweep-specific cache key so it doesn't clash with 3-approach runs.
-            # force_retrain=True → skip load_cache entirely; still save at the end
-            # so subsequent normal runs benefit from the fresh result.
-            cache_key   = make_cache_key(
-                f"sweep2_{last_date_str}", yr, fee_bps, epochs,
-                split_option, False, lookback
-            )
+            # ── Model cache — IDENTICAL key to app.py ────────────────────────
+            # This is the critical change: no "sweep2_" prefix.
+            # If app.py already ran and cached year `yr`, we load it here for free.
+            cache_key   = make_cache_key(last_date_str, yr, fee_bps, int(epochs),
+                                         split_option, False, lookback)
             cached_data = None if force_retrain else load_cache(cache_key)
 
             if cached_data is not None:
-                result          = cached_data["result"]
-                proba           = cached_data["proba"]
+                # ── Cache hit: results dict has all 3 approaches ──────────────
+                results      = cached_data["results"]
+                trained_info = cached_data["trained_info"]
                 row["from_cache"] = True
                 row["run_date"]   = cached_data.get("run_date", last_date_str)
+
             else:
-                # ── Full retrain ──────────────────────────────────────────────
+                # ── Full retrain: all 3 approaches, identical to app.py ───────
                 X_seq, y_seq = build_sequences(X_raw, y_raw, lookback)
                 y_labels     = returns_to_labels(y_seq)
 
@@ -161,53 +180,106 @@ def run_multiyear_sweep(
                 (_,       y_train_l,  _,    y_val_l,
                  _,       _)        = train_val_test_split(X_seq, y_labels, train_pct, val_pct)
 
+                if len(X_train) == 0 or len(X_val) == 0 or len(X_test) == 0:
+                    row["error"] = "Empty train/val/test split — try an earlier start year"
+                    sweep_results.append(row)
+                    continue
+
                 X_train_s, X_val_s, X_test_s, _ = scale_features(X_train, X_val, X_test)
 
                 train_size = len(X_train)
                 val_size   = len(X_val)
                 test_start = lookback + train_size + val_size
                 test_dates = df.index[test_start: test_start + len(X_test)]
+                test_slice = slice(test_start, test_start + len(X_test))
 
-                model_out    = train_approach2(
-                    X_train_s, y_train_l, X_val_s, y_val_l,
-                    X_flat_all=X_raw, feature_names=input_features,
-                    lookback=lookback, train_size=train_size,
-                    val_size=val_size, n_classes=n_classes, epochs=epochs,
-                )
-                preds, proba = predict_approach2(
-                    model_out[0], X_test_s, X_raw, model_out[3], model_out[2],
-                    lookback, train_size, val_size,
-                )
-                result = execute_strategy(
-                    preds, proba, y_test_r, test_dates,
-                    target_etfs, fee_bps, tbill_rate,
-                )
+                results, trained_info = {}, {}
 
-                from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td2
-                _run_date = (_dt2.now(_tz2.utc) - _td2(hours=5)).strftime("%Y-%m-%d")
+                # Train all 3 — same order and logic as app.py
+                for approach, train_fn, predict_fn in [
+                    (
+                        "Approach 1",
+                        lambda: train_approach1(
+                            X_train_s, y_train_l, X_val_s, y_val_l,
+                            n_classes=n_classes, epochs=int(epochs)
+                        ),
+                        lambda m: predict_approach1(m[0], X_test_s),
+                    ),
+                    (
+                        "Approach 2",
+                        lambda: train_approach2(
+                            X_train_s, y_train_l, X_val_s, y_val_l,
+                            X_flat_all=X_raw, feature_names=input_features,
+                            lookback=lookback, train_size=train_size,
+                            val_size=val_size, n_classes=n_classes,
+                            epochs=int(epochs)
+                        ),
+                        lambda m: predict_approach2(
+                            m[0], X_test_s, X_raw, m[3], m[2],
+                            lookback, train_size, val_size
+                        ),
+                    ),
+                    (
+                        "Approach 3",
+                        lambda: train_approach3(
+                            X_train_s, y_train_l, X_val_s, y_val_l,
+                            n_classes=n_classes, epochs=int(epochs)
+                        ),
+                        lambda m: predict_approach3(m[0], X_test_s),
+                    ),
+                ]:
+                    try:
+                        model_out    = train_fn()
+                        preds, proba = predict_fn(model_out)
+                        results[approach] = execute_strategy(
+                            preds, proba, y_test_r, test_dates,
+                            target_etfs, fee_bps, tbill_rate,
+                        )
+                        trained_info[approach] = {"proba": proba}
+                    except Exception as approach_err:
+                        # Soft failure per approach — same as app.py
+                        results[approach]      = None
+                        trained_info[approach] = {"proba": None}
 
-                # Always save to cache (even after force retrain) so the next
-                # normal run can use these fresh results without retraining again
+                _run_date = (_dt.now(_tz.utc) - _td(hours=5)).strftime("%Y-%m-%d")
+
+                # Save with the SAME key as app.py so both tabs share the cache
                 save_cache(cache_key, {
-                    "result":   result,
-                    "proba":    proba,
-                    "run_date": _run_date,
+                    "results":      results,
+                    "trained_info": trained_info,
+                    "test_dates":   list(test_dates),
+                    "test_slice":   test_slice,
+                    "run_date":     _run_date,
                 })
 
-                row["from_cache"] = False   # freshly trained this run
+                row["from_cache"] = False
+                row["run_date"]   = _run_date
 
-            # ── Conviction ────────────────────────────────────────────────────
-            conviction = compute_conviction(proba[-1], target_etfs, include_cash=False)
+            # ── Pick winner — identical logic to app.py ───────────────────────
+            winner_name = select_winner(results)
+            winner_res  = results.get(winner_name)
 
-            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+            if winner_res is None:
+                row["error"] = "All approaches failed for this year"
+                sweep_results.append(row)
+                continue
+
+            # ── Conviction from winner's last probability vector ───────────────
+            winner_proba = trained_info[winner_name]["proba"]
+            if winner_proba is not None:
+                conviction = compute_conviction(
+                    winner_proba[-1], target_etfs, include_cash=False
+                )
+                row["z_score"]    = conviction["z_score"]
+                row["conviction"] = conviction["label"]
+
             row.update({
-                "run_date":   (_dt.now(_tz.utc) - _td(hours=5)).strftime("%Y-%m-%d"),
-                "signal":     result["next_signal"],
-                "z_score":    conviction["z_score"],
-                "conviction": conviction["label"],
-                "ann_return": result["ann_return"],
-                "sharpe":     result["sharpe"],
-                "max_dd":     result["max_dd"],
+                "signal":          winner_res["next_signal"],
+                "winner_approach": winner_name,
+                "ann_return":      winner_res["ann_return"],
+                "sharpe":          winner_res["sharpe"],
+                "max_dd":          winner_res["max_dd"],
+                "run_date":        row.get("run_date") or last_date_str,
             })
 
         except Exception as e:
@@ -227,11 +299,10 @@ def run_multiyear_sweep(
 # Per-year composite score:
 #   40% Ann. Return  (higher = better)
 #   20% Z-Score      (higher = better)
-#   20% Sharpe       (higher = better, positive preferred)
-#   20% Max Drawdown (lower magnitude = better, i.e. score on -max_dd)
+#   20% Sharpe       (higher = better)
+#   20% Max Drawdown (lower magnitude = better → score on −max_dd)
 #
-# Each metric is min-max normalised across all valid years before weighting,
-# so no single metric dominates due to scale differences.
+# Each metric is min-max normalised across all valid years before weighting.
 
 W_RETURN = 0.40
 W_ZSCORE = 0.20
@@ -241,9 +312,8 @@ W_DD     = 0.20
 
 def _compute_weighted_scores(valid: list) -> list:
     """
-    Returns a copy of valid rows, each augmented with:
-      - 'weighted_score'  : float in [0, 1]
-      - 'score_breakdown' : dict of normalised component scores
+    Returns a copy of valid rows, each augmented with 'weighted_score'
+    and 'score_breakdown'.
     """
     def _minmax(vals):
         arr = np.array(vals, dtype=float)
@@ -272,22 +342,19 @@ def _compute_weighted_scores(valid: list) -> list:
             **r,
             "weighted_score": float(composite),
             "score_breakdown": {
-                "Return (40%)":   float(n_ret[i]),
-                "Z-Score (20%)":  float(n_z[i]),
-                "Sharpe (20%)":   float(n_sh[i]),
-                "Max DD (20%)":   float(n_dd[i]),
+                "Return (40%)": float(n_ret[i]),
+                "Z-Score (20%)": float(n_z[i]),
+                "Sharpe (20%)": float(n_sh[i]),
+                "Max DD (20%)": float(n_dd[i]),
             },
         })
     return scored
 
 
-# ── Display helpers ───────────────────────────────────────────────────────────
+# ── Chart helpers ─────────────────────────────────────────────────────────────
 
 def _vote_tally_chart(scored: list) -> go.Figure:
-    """
-    Bar chart: weighted score accumulated per ETF across all start years.
-    """
-    from collections import defaultdict
+    """Bar chart: cumulative weighted score per ETF across all start years."""
     etf_scores = defaultdict(float)
     etf_counts = Counter()
 
@@ -317,7 +384,7 @@ def _vote_tally_chart(scored: list) -> go.Figure:
         template="plotly_dark",
         height=340,
         title=dict(
-            text="Weighted Score per ETF  (40% Return · 20% Z · 20% Sharpe · 20% -MaxDD)",
+            text="Weighted Score per ETF  (40% Return · 20% Z · 20% Sharpe · 20% −MaxDD)",
             font=dict(size=13),
         ),
         xaxis_title="ETF",
@@ -332,11 +399,12 @@ def _vote_tally_chart(scored: list) -> go.Figure:
 
 def _conviction_scatter(sweep_results: list) -> go.Figure:
     """Scatter: start year vs Z-score, coloured by ETF signal."""
-    valid = [r for r in sweep_results if r["signal"] is not None and r["z_score"] is not None]
+    valid = [r for r in sweep_results
+             if r["signal"] is not None and r["z_score"] is not None]
     if not valid:
         return None
 
-    fig = go.Figure()
+    fig  = go.Figure()
     seen = set()
     for r in valid:
         etf = r["signal"]
@@ -364,56 +432,58 @@ def _conviction_scatter(sweep_results: list) -> go.Figure:
         xaxis=dict(title="Start Year", dtick=1),
         yaxis=dict(title="Z-Score (σ)"),
         margin=dict(l=40, r=30, t=50, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.35, xanchor="center", x=0.5),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35,
+                    xanchor="center", x=0.5),
     )
     return fig
 
 
 def _build_full_table(scored: list) -> pd.DataFrame:
-    """Build the full per-year comparison DataFrame, including weighted score."""
+    """Build the full per-year comparison DataFrame."""
     rows = []
     for r in scored:
         if r.get("error"):
             rows.append({
-                "Start Year":   r["start_year"],
-                "Signal":       "ERROR",
-                "Wtd Score":    "—",
-                "Conviction":   "—",
-                "Z-Score":      "—",
-                "Ann. Return":  "—",
-                "Sharpe":       "—",
-                "Max Drawdown": "—",
-                "Lookback":     "—",
-                "Cache":        "—",
-                "Note":         r["error"][:40],
+                "Start Year":     r["start_year"],
+                "Signal":         "ERROR",
+                "Winner":         "—",
+                "Wtd Score":      "—",
+                "Conviction":     "—",
+                "Z-Score":        "—",
+                "Ann. Return":    "—",
+                "Sharpe":         "—",
+                "Max Drawdown":   "—",
+                "Lookback":       "—",
+                "Cache":          "—",
+                "Note":           r["error"][:50],
             })
         else:
             ws = r.get("weighted_score")
             rows.append({
                 "Start Year":   r["start_year"],
-                "Signal":       r["signal"]      or "—",
-                "Wtd Score":    f"{ws:.3f}"       if ws   is not None else "—",
-                "Conviction":   r["conviction"]  or "—",
-                "Z-Score":      f"{r['z_score']:.2f}σ"       if r["z_score"]    is not None else "—",
-                "Ann. Return":  f"{r['ann_return']*100:.2f}%" if r["ann_return"] is not None else "—",
-                "Sharpe":       f"{r['sharpe']:.2f}"          if r["sharpe"]     is not None else "—",
-                "Max Drawdown": f"{r['max_dd']*100:.2f}%"     if r["max_dd"]     is not None else "—",
-                "Lookback":     f"{r['lookback']}d"           if r["lookback"]   is not None else "—",
+                "Signal":       r["signal"]          or "—",
+                "Winner":       r.get("winner_approach", "—") or "—",
+                "Wtd Score":    f"{ws:.3f}"            if ws is not None              else "—",
+                "Conviction":   r["conviction"]       or "—",
+                "Z-Score":      f"{r['z_score']:.2f}σ"        if r["z_score"]    is not None else "—",
+                "Ann. Return":  f"{r['ann_return']*100:.2f}%"  if r["ann_return"] is not None else "—",
+                "Sharpe":       f"{r['sharpe']:.2f}"           if r["sharpe"]     is not None else "—",
+                "Max Drawdown": f"{r['max_dd']*100:.2f}%"      if r["max_dd"]     is not None else "—",
+                "Lookback":     f"{r['lookback']}d"            if r["lookback"]   is not None else "—",
                 "Cache":        "⚡" if r["from_cache"] else "🆕",
                 "Note":         "",
             })
     return pd.DataFrame(rows)
 
 
+# ── Consensus banner ──────────────────────────────────────────────────────────
+
 def _consensus_banner(scored: list, run_date_str: str = ""):
-    """
-    Show the consensus signal selected by highest cumulative weighted score.
-    """
+    """Show the consensus signal — highest cumulative weighted score wins."""
     if not scored:
         st.warning("No valid signals collected.")
         return
 
-    from collections import defaultdict
     etf_total_score = defaultdict(float)
     etf_counts      = Counter()
     for r in scored:
@@ -447,13 +517,14 @@ def _consensus_banner(scored: list, run_date_str: str = ""):
                 box-shadow:0 8px 20px rgba(0,0,0,0.3); margin:16px 0;">
       <div style="color:rgba(255,255,255,0.75); font-size:12px;
                   letter-spacing:3px; margin-bottom:6px; text-align:center;">
-        WEIGHTED CONSENSUS · APPROACH 2 · ALL START YEARS · {run_date_str}
+        WEIGHTED CONSENSUS · ALL 3 APPROACHES · ALL START YEARS · {run_date_str}
       </div>
       <h1 style="color:white; font-size:44px; font-weight:900; text-align:center;
                  margin:4px 0; text-shadow:2px 2px 6px rgba(0,0,0,0.4);">
         🎯 {top_signal}
       </h1>
-      <div style="text-align:center; color:rgba(255,255,255,0.85); font-size:15px; margin-top:8px;">
+      <div style="text-align:center; color:rgba(255,255,255,0.85);
+                  font-size:15px; margin-top:8px;">
         {strength} &nbsp;·&nbsp;
         Score share <b>{score_pct:.0f}%</b> &nbsp;·&nbsp;
         <b>{top_votes}/{total_years}</b> years &nbsp;·&nbsp;
@@ -476,7 +547,9 @@ def _consensus_banner(scored: list, run_date_str: str = ""):
     if others:
         parts = " &nbsp;|&nbsp; ".join(
             f'<span style="color:{_etf_colour(e)}; font-weight:600;">{e}</span> '
-            f'<span style="color:#aaa;">(score {s:.2f} · {etf_counts[e]} yr{"s" if etf_counts[e]>1 else ""})</span>'
+            f'<span style="color:#aaa;">'
+            f'(score {s:.2f} · {etf_counts[e]} yr{"s" if etf_counts[e]>1 else ""})'
+            f'</span>'
             for e, s in others
         )
         st.markdown(
@@ -492,7 +565,7 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
     """Render the full multi-year consensus UI."""
 
     valid  = [r for r in sweep_results if r["signal"] is not None]
-    failed = [r for r in sweep_results if r["error"]  is not None]
+    failed = [r for r in sweep_results if r.get("error") is not None]
 
     if failed:
         with st.expander(f"⚠️ {len(failed)} year(s) failed — click to see details"):
@@ -505,10 +578,12 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
 
     scored       = _compute_weighted_scores(valid)
     scored_by_yr = {r["start_year"]: r for r in scored}
+    # Preserve original order (including failed rows) for the table
     full_scored  = [scored_by_yr.get(r["start_year"], r) for r in sweep_results]
 
     run_dates    = [r.get("run_date", "") for r in scored if r.get("run_date")]
     run_date_str = max(run_dates) if run_dates else ""
+
     _consensus_banner(scored, run_date_str=run_date_str)
 
     st.divider()
@@ -526,23 +601,28 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
     st.subheader("📋 Full Per-Year Breakdown")
     st.caption(
         "**Wtd Score** = 40% Ann. Return + 20% Z-Score + 20% Sharpe + 20% (−Max DD), "
-        "each metric min-max normalised across all years.  "
+        "each metric min-max normalised across all years. "
+        "**Winner** = approach with highest annualised return on that year's test set "
+        "(same logic as Single-Year tab). "
         "⚡ = loaded from cache (no retraining). 🆕 = freshly trained."
     )
 
     table_df = _build_full_table(full_scored)
 
     def _style_table(df: pd.DataFrame):
+        cols = list(df.columns)
+
         def _row_style(row):
             styles = [""] * len(row)
             sig = row.get("Signal", "")
             if sig and sig not in ("—", "ERROR"):
                 col = _etf_colour(sig)
-                styles[list(df.columns).index("Signal")] = (
-                    f"background-color: {col}22; color: {col}; font-weight: 700;"
-                )
-                if "Wtd Score" in df.columns:
-                    styles[list(df.columns).index("Wtd Score")] = (
+                if "Signal" in cols:
+                    styles[cols.index("Signal")] = (
+                        f"background-color: {col}22; color: {col}; font-weight: 700;"
+                    )
+                if "Wtd Score" in cols:
+                    styles[cols.index("Wtd Score")] = (
                         f"color: {col}; font-weight: 700;"
                     )
             if row.get("Note", ""):
@@ -568,16 +648,24 @@ def show_multiyear_results(sweep_results: list, sweep_years: list):
     st.divider()
     st.subheader("📖 How to Read These Results")
     st.markdown("""
+**How each year's signal is chosen:**
+Each start year runs all 3 approaches (Wavelet, Regime-Conditioned, Multi-Scale)
+on a data window starting from that year, using the same train/val/test split,
+lookback, and fee settings as the sidebar. The **winner** is the approach with
+the highest annualised return on the out-of-sample test set — identical to
+how the Single-Year tab picks its winner. This means the 2019 consensus row
+will always match a fresh Single-Year run with start year 2019.
+
 **Why does the signal change by start year?**
-Each start year defines the *training regime* the model learns from.
+Each start year defines a different training regime:
 - **2010**: includes GFC recovery, euro crisis, QE era
 - **2016+**: post-taper, Trump era, COVID shock
 - **2021+**: rate-hike cycle, inflation regime
 
-A different data window = a different view of which ETF leads in risk-off or momentum environments.
+A different data window = a different view of which ETF leads in each regime.
 
 **How the weighted consensus works:**
-Each year's result gets a composite score (0–1) based on four normalised metrics:
+Each year's winner result gets a composite score (0–1) based on four normalised metrics:
 
 | Metric | Weight | Logic |
 |---|---|---|
@@ -589,17 +677,19 @@ Each year's result gets a composite score (0–1) based on four normalised metri
 The ETF with the highest **total cumulative score** across all start years wins.
 
 **Score share interpretation:**
+
 | Score share | Interpretation |
 |---|---|
 | ≥ 60% | Strong consensus — high confidence |
 | 40–60% | Majority signal — moderate confidence |
 | < 40% | Split signal — regime unstable, consider caution |
 
-**Force Retrain vs Run Consensus Sweep:**
+**Cache behaviour:**
 | Button | Behaviour |
 |---|---|
-| 🚀 Run Consensus Sweep | Uses cached results where available; only retrains years with no cache hit |
-| 🔄 Force Retrain All | Ignores all cache; retrains every year from scratch; saves fresh results to cache |
+| 🚀 Run Consensus Sweep | Loads from cache where available. If the Single-Year tab already ran a year, it's free. |
+| 🔄 Force Retrain All | Ignores all cache; retrains every year from scratch; saves fresh results to cache. |
 
-> 💡 **Best practice:** Use **Run Consensus Sweep** daily (fast, cache-aware). Use **Force Retrain All** when you change epochs, fee, or split settings and want results that reflect the new configuration.
+> 💡 **Best practice:** Run the Single-Year tab for today's start year first —
+> the sweep will pick up that cached result instantly and only retrain the other years.
     """)
