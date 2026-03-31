@@ -172,6 +172,7 @@ def run_module(module_type: str, df_raw: pd.DataFrame, start_yr: int, fee_bps: i
             y_raw[mask, j] = 0.0
 
     # ── Auto-select lookback ──────────────────────────────────────────────────
+    # Include module_type in cache key to keep FI and Equity separate
     lb_key = make_cache_key(f"{last_date_str}_{module_type}", start_yr, fee_bps, int(epochs),
                             split_option, False, 0)
     lb_cached = load_cache(f"lb_{lb_key}")
