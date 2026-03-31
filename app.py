@@ -298,6 +298,11 @@ def display_single_year_results(module_type: str):
     """Display single-year results for a specific module."""
     prefix = module_type
     
+    # Check if results exist
+    if not st.session_state.get(f"{prefix}_output_ready"):
+        st.info(f"👈 Click **🚀 Run Analysis** in the header above to see Single-Year results.")
+        return
+    
     results = st.session_state.get(f"{prefix}_results")
     trained_info = st.session_state.get(f"{prefix}_trained_info")
     test_dates = st.session_state.get(f"{prefix}_test_dates")
@@ -485,19 +490,17 @@ def build_module_tab(module_type: str, module_name: str, etf_list: str,
         if success:
             st.rerun()
     
-    # Only show sub-tabs if analysis has been run
-    if st.session_state.get(f"{module_type}_output_ready"):
-        # Create sub-tabs for Single-Year and Multi-Year
-        tab_single, tab_multi = st.tabs(["📊 Single-Year Results", "🔁 Multi-Year Consensus"])
-        
-        with tab_single:
-            display_single_year_results(module_type)
-        
-        with tab_multi:
-            display_multiyear_sweep(module_type, last_date_str, fee_bps, epochs,
-                                   split_option, train_pct, val_pct, df_raw)
-    else:
-        st.info(f"👈 Click **🚀 Run {module_name} Analysis** to start.")
+    st.divider()
+    
+    # ALWAYS show sub-tabs - they handle their own "not ready" states
+    tab_single, tab_multi = st.tabs(["📊 Single-Year Results", "🔁 Multi-Year Consensus"])
+    
+    with tab_single:
+        display_single_year_results(module_type)
+    
+    with tab_multi:
+        display_multiyear_sweep(module_type, last_date_str, fee_bps, epochs,
+                               split_option, train_pct, val_pct, df_raw)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN TABS: FI and Equity
