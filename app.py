@@ -1,7 +1,7 @@
 """
 app.py
 P2-ETF-CNN-LSTM-ALTERNATIVE-APPROACHES
-Clean dual-module version with separate Multi-Year Sweep in each tab
+Clean dual-module version with Single-Year and Multi-Year tabs inside each module
 """
 
 import os
@@ -292,10 +292,10 @@ def run_module(module_type: str, df_raw: pd.DataFrame, start_yr: int, fee_bps: i
     return True
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DISPLAY FUNCTION
+# DISPLAY SINGLE-YEAR RESULTS
 # ═══════════════════════════════════════════════════════════════════════════════
-def display_module_results(module_type: str):
-    """Display results for a specific module."""
+def display_single_year_results(module_type: str):
+    """Display single-year results for a specific module."""
     prefix = module_type
     
     results = st.session_state.get(f"{prefix}_results")
@@ -363,20 +363,20 @@ def display_module_results(module_type: str):
     show_audit_trail(winner_res["audit_trail"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MULTI-YEAR SWEEP FUNCTION (per module)
+# DISPLAY MULTI-YEAR SWEEP (per module)
 # ═══════════════════════════════════════════════════════════════════════════════
-def show_module_multiyear(module_type: str, last_date_str: str, fee_bps: int, epochs: int,
-                          split_option: str, train_pct: float, val_pct: float, df_raw: pd.DataFrame):
+def display_multiyear_sweep(module_type: str, last_date_str: str, fee_bps: int, epochs: int,
+                            split_option: str, train_pct: float, val_pct: float, df_raw: pd.DataFrame):
     """Display multi-year sweep section for a specific module."""
     prefix = module_type
     SWEEP_YEARS = [2010, 2012, 2014, 2016, 2018, 2019, 2021, 2023]
     
-    st.divider()
     st.subheader("🔁 Multi-Year Consensus Sweep")
     
     st.markdown(
         "Runs **all 3 approaches** across **8 start years**, picks the winner per year, "
-        "and aggregates signals into a weighted consensus vote."
+        "and aggregates signals into a weighted consensus vote. "
+        "Each year uses the same fee, epochs, and split settings as the sidebar."
     )
     
     st.caption(f"Sweep years: {', '.join(str(y) for y in SWEEP_YEARS)}")
@@ -388,7 +388,7 @@ def show_module_multiyear(module_type: str, last_date_str: str, fee_bps: int, ep
     
     with col_run:
         sweep_button = st.button(
-            "🚀 Run Sweep",
+            "🚀 Run Consensus Sweep",
             type="primary",
             use_container_width=True,
             key=f"{prefix}_sweep_run"
@@ -396,7 +396,7 @@ def show_module_multiyear(module_type: str, last_date_str: str, fee_bps: int, ep
     
     with col_force:
         force_retrain_button = st.button(
-            "🔄 Force Retrain",
+            "🔄 Force Retrain All",
             type="secondary",
             use_container_width=True,
             key=f"{prefix}_sweep_force"
@@ -406,7 +406,7 @@ def show_module_multiyear(module_type: str, last_date_str: str, fee_bps: int, ep
     if force_retrain_button:
         st.session_state[f"{prefix}_multiyear_ready"] = False
         st.session_state[f"{prefix}_multiyear_results"] = None
-        with st.spinner("Retraining all years..."):
+        with st.spinner("🗑️ Sweep cache cleared — retraining all years from scratch…"):
             try:
                 sweep_results = run_multiyear_sweep(
                     df_raw=df_raw,
@@ -422,7 +422,6 @@ def show_module_multiyear(module_type: str, last_date_str: str, fee_bps: int, ep
                 )
                 st.session_state[f"{prefix}_multiyear_results"] = sweep_results
                 st.session_state[f"{prefix}_multiyear_ready"] = True
-                st.success("✅ Sweep complete!")
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ Sweep failed: {e}")
@@ -445,7 +444,6 @@ def show_module_multiyear(module_type: str, last_date_str: str, fee_bps: int, ep
                 )
                 st.session_state[f"{prefix}_multiyear_results"] = sweep_results
                 st.session_state[f"{prefix}_multiyear_ready"] = True
-                st.success("✅ Sweep complete!")
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ Sweep failed: {e}")
@@ -457,69 +455,79 @@ def show_module_multiyear(module_type: str, last_date_str: str, fee_bps: int, ep
             sweep_years=SWEEP_YEARS,
         )
     elif not st.session_state.get(f"{prefix}_multiyear_ready"):
-        st.info("Click **🚀 Run Sweep** to analyse all start years.")
+        st.info("Click **🚀 Run Consensus Sweep** to analyse all start years at once.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MAIN TABS
+# MAIN MODULE TAB BUILDER
+# ═══════════════════════════════════════════════════════════════════════════════
+def build_module_tab(module_type: str, module_name: str, etf_list: str, 
+                     last_date_str: str, fee_bps: int, epochs: int,
+                     split_option: str, train_pct: float, val_pct: float, df_raw: pd.DataFrame):
+    """Build a complete module tab with Single-Year and Multi-Year sub-tabs."""
+    
+    st.header(f"{module_name} ETF Rotation")
+    st.markdown(f"**ETFs:** {etf_list}")
+    
+    # Run button at the top of the tab
+    run_button = st.button(
+        f"🚀 Run {module_name} Analysis", 
+        type="primary", 
+        use_container_width=True,
+        key=f"{module_type}_run_button"
+    )
+    
+    if run_button:
+        with st.spinner(f"Running {module_name} module..."):
+            success = run_module(
+                module_type, df_raw, start_yr, fee_bps, epochs, 
+                train_pct, val_pct, last_date_str
+            )
+        if success:
+            st.rerun()
+    
+    # Only show sub-tabs if analysis has been run
+    if st.session_state.get(f"{module_type}_output_ready"):
+        # Create sub-tabs for Single-Year and Multi-Year
+        tab_single, tab_multi = st.tabs(["📊 Single-Year Results", "🔁 Multi-Year Consensus"])
+        
+        with tab_single:
+            display_single_year_results(module_type)
+        
+        with tab_multi:
+            display_multiyear_sweep(module_type, last_date_str, fee_bps, epochs,
+                                   split_option, train_pct, val_pct, df_raw)
+    else:
+        st.info(f"👈 Click **🚀 Run {module_name} Analysis** to start.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN TABS: FI and Equity
 # ═══════════════════════════════════════════════════════════════════════════════
 tab_fi, tab_equity = st.tabs(["🏛️ Fixed Income (FI)", "📈 Equity"])
 
-# ── TAB 1: FIXED INCOME ────────────────────────────────────────────────────────
 with tab_fi:
-    st.header("🏛️ Fixed Income ETF Rotation")
-    st.markdown("**ETFs:** TLT, VNQ, SLV, GLD, LQD, HYG, VCIT")
-    
-    run_fi = st.button(
-        "🚀 Run FI Analysis", 
-        type="primary", 
-        use_container_width=True,
-        key="fi_run_button"
+    build_module_tab(
+        module_type="fi",
+        module_name="Fixed Income",
+        etf_list="TLT, VNQ, SLV, GLD, LQD, HYG, VCIT",
+        last_date_str=last_date_str,
+        fee_bps=fee_bps,
+        epochs=epochs,
+        split_option=split_option,
+        train_pct=train_pct,
+        val_pct=val_pct,
+        df_raw=df_raw
     )
-    
-    if run_fi:
-        with st.spinner("Running Fixed Income module..."):
-            success = run_module(
-                "fi", df_raw, start_yr, fee_bps, epochs, 
-                train_pct, val_pct, last_date_str
-            )
-        if success:
-            st.rerun()
-    
-    if st.session_state.get("fi_output_ready"):
-        display_module_results("fi")
-        
-        # Multi-year sweep INSIDE the FI tab
-        show_module_multiyear("fi", last_date_str, fee_bps, epochs,
-                             split_option, train_pct, val_pct, df_raw)
-    else:
-        st.info("👈 Click **🚀 Run FI Analysis** to start.")
 
-# ── TAB 2: EQUITY ──────────────────────────────────────────────────────────────
 with tab_equity:
-    st.header("📈 Equity ETF Rotation")
-    st.markdown("**ETFs:** QQQ, XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLU, XME, GDX, IWM")
-    
-    run_eq = st.button(
-        "🚀 Run Equity Analysis", 
-        type="primary", 
-        use_container_width=True,
-        key="eq_run_button"
+    build_module_tab(
+        module_type="eq",
+        module_name="Equity",
+        etf_list="QQQ, XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLU, XME, GDX, IWM",
+        last_date_str=last_date_str,
+        fee_bps=fee_bps,
+        epochs=epochs,
+        split_option=split_option,
+        train_pct=train_pct,
+        val_pct=val_pct,
+        df_raw=df_raw
     )
-    
-    if run_eq:
-        with st.spinner("Running Equity module..."):
-            success = run_module(
-                "eq", df_raw, start_yr, fee_bps, epochs,
-                train_pct, val_pct, last_date_str
-            )
-        if success:
-            st.rerun()
-    
-    if st.session_state.get("eq_output_ready"):
-        display_module_results("eq")
-        
-        # Multi-year sweep INSIDE the Equity tab
-        show_module_multiyear("eq", last_date_str, fee_bps, epochs,
-                             split_option, train_pct, val_pct, df_raw)
-    else:
-        st.info("👈 Click **🚀 Run Equity Analysis** to start.")
