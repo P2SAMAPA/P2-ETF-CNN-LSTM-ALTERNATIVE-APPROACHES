@@ -1,13 +1,7 @@
 """
 app.py
 P2-ETF-CNN-LSTM-ALTERNATIVE-APPROACHES
-Dual-module version: FI and Equity ETFs
-- Session state persistence (results don't vanish on rerun)
-- Model caching keyed by data date + config params + module_type
-- Auto-lookback (30/45/60d)
-- CASH is a drawdown risk overlay (not a model class)
-- Ann. Return compared vs SPY in metrics row
-- Two main tabs: Fixed Income (FI) and Equity
+Clean dual-module version with separate Multi-Year Sweep in each tab
 """
 
 import os
@@ -39,23 +33,33 @@ st.set_page_config(page_title="P2-ETF-CNN-LSTM", page_icon="🧠", layout="wide"
 
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
-# ── Session state init ────────────────────────────────────────────────────────
-for key, default in [
-    # FI module state
-    ("fi_output_ready", False), ("fi_results", None), ("fi_trained_info", None),
-    ("fi_test_dates", None), ("fi_test_slice", None), ("fi_optimal_lookback", None),
-    ("fi_df_for_chart", None), ("fi_target_etfs", None),
-    # Equity module state
-    ("eq_output_ready", False), ("eq_results", None), ("eq_trained_info", None),
-    ("eq_test_dates", None), ("eq_test_slice", None), ("eq_optimal_lookback", None),
-    ("eq_df_for_chart", None), ("eq_target_etfs", None),
-    # Shared
-    ("tbill_rate", None), ("from_cache", False),
-    # Multi-year sweep state
-    ("multiyear_ready", False), ("multiyear_results", None),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+# ── Initialize session state with module prefixes ───────────────────────────
+def init_module_state(prefix):
+    """Initialize all state keys for a given module prefix."""
+    defaults = {
+        f"{prefix}_output_ready": False,
+        f"{prefix}_results": None,
+        f"{prefix}_trained_info": None,
+        f"{prefix}_test_dates": None,
+        f"{prefix}_test_slice": None,
+        f"{prefix}_optimal_lookback": None,
+        f"{prefix}_df_for_chart": None,
+        f"{prefix}_target_etfs": None,
+        # Multi-year sweep state (per module)
+        f"{prefix}_multiyear_ready": False,
+        f"{prefix}_multiyear_results": None,
+    }
+    for key, default in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+# Initialize both modules
+init_module_state("fi")
+init_module_state("eq")
+
+# Shared state
+if "tbill_rate" not in st.session_state:
+    st.session_state["tbill_rate"] = None
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -93,7 +97,6 @@ with st.sidebar:
     st.divider()
     st.subheader("📦 Dataset Info")
     
-    # Show both FI and Equity ETF availability
     fi_summary = dataset_summary(df_raw, module_type="fi")
     eq_summary = dataset_summary(df_raw, module_type="equity")
     
@@ -115,48 +118,41 @@ st.caption("Multi-Asset ETF Rotation using CNN-LSTM | Fixed Income & Equity Modu
 
 show_freshness_status(freshness)
 
-# ── MAIN TABS: FI vs Equity ───────────────────────────────────────────────────
-tab_fi, tab_equity = st.tabs(["🏛️ Fixed Income (FI)", "📈 Equity"])
-
 # ═══════════════════════════════════════════════════════════════════════════════
-# HELPER FUNCTION: Run Module
+# MODULE RUNNER FUNCTION
 # ═══════════════════════════════════════════════════════════════════════════════
 def run_module(module_type: str, df_raw: pd.DataFrame, start_yr: int, fee_bps: int, 
                epochs: int, train_pct: float, val_pct: float, last_date_str: str):
     """Execute all 3 approaches for a given module type (fi or equity)."""
+    prefix = module_type
     
-    prefix = "fi" if module_type == "fi" else "eq"
-    output_ready_key = f"{prefix}_output_ready"
-    results_key = f"{prefix}_results"
-    trained_info_key = f"{prefix}_trained_info"
-    test_dates_key = f"{prefix}_test_dates"
-    test_slice_key = f"{prefix}_test_slice"
-    optimal_lookback_key = f"{prefix}_optimal_lookback"
-    df_chart_key = f"{prefix}_df_for_chart"
-    target_etfs_key = f"{prefix}_target_etfs"
-    
-    st.session_state[output_ready_key] = False
+    st.session_state[f"{prefix}_output_ready"] = False
     
     df = df_raw[df_raw.index.year >= start_yr].copy()
     n_rows = len(df)
+    
+    if n_rows < 100:
+        st.error(f"❌ Insufficient data: only {n_rows} rows available from {start_yr}.")
+        return False
     
     st.write(f"📅 **Data:** {df.index[0].strftime('%Y-%m-%d')} → {df.index[-1].strftime('%Y-%m-%d')} "
              f"({df.index[-1].year - df.index[0].year + 1} years, {n_rows} rows)")
 
     try:
-        input_features, target_etfs, tbill_rate, df, col_info = get_features_and_targets(df, module_type=module_type)
+        input_features, target_etfs, tbill_rate, df, col_info = get_features_and_targets(
+            df, module_type=module_type
+        )
     except ValueError as e:
         st.error(str(e))
         return False
 
-    n_etfs = len(target_etfs)
-    n_classes = n_etfs
+    n_classes = len(target_etfs)
 
     st.info(
         f"🎯 **Targets:** {', '.join([t.replace('_Ret','') for t in target_etfs])} · "
         f"**Features:** {len(input_features)} signals · "
         f"**T-bill:** {tbill_rate*100:.2f}% · "
-        f"**Rows after feature engineering:** {len(df)}"
+        f"**Rows:** {len(df)}"
     )
 
     X_raw = df[input_features].values.astype(np.float32)
@@ -171,36 +167,32 @@ def run_module(module_type: str, df_raw: pd.DataFrame, start_yr: int, fee_bps: i
         if mask.any():
             y_raw[mask, j] = 0.0
 
-    # ── Auto-select lookback ──────────────────────────────────────────────────
-    # Include module_type in cache key to keep FI and Equity separate
-    lb_key = make_cache_key(f"{last_date_str}_{module_type}", start_yr, fee_bps, int(epochs),
+    # Auto-select lookback
+    cache_prefix = f"{last_date_str}_{module_type}"
+    lb_key = make_cache_key(cache_prefix, start_yr, fee_bps, int(epochs),
                             split_option, False, 0)
     lb_cached = load_cache(f"lb_{lb_key}")
 
     if lb_cached is not None:
         optimal_lookback = lb_cached["optimal_lookback"]
-        st.success(f"⚡ Cache hit · Optimal lookback: **{optimal_lookback}d**")
+        st.success(f"⚡ Lookback cache hit: **{optimal_lookback}d**")
     else:
         with st.spinner("🔍 Auto-selecting optimal lookback (30 / 45 / 60d)..."):
             try:
                 optimal_lookback = find_best_lookback(
-                    X_raw, y_raw,
-                    train_pct, val_pct, n_classes,
+                    X_raw, y_raw, train_pct, val_pct, n_classes,
                     candidates=[30, 45, 60],
                 )
             except ValueError as e:
-                st.error(
-                    f"❌ Could not find a valid lookback window.\n\n{e}\n\n"
-                    f"**Try an earlier Start Year** (e.g. 2013 or earlier)."
-                )
+                st.error(f"❌ Lookback selection failed: {e}")
                 return False
         save_cache(f"lb_{lb_key}", {"optimal_lookback": optimal_lookback})
-        st.success(f"📐 Optimal lookback: **{optimal_lookback}d** (auto-selected)")
+        st.success(f"📐 Optimal lookback: **{optimal_lookback}d**")
 
     lookback = optimal_lookback
 
-    # ── Check model cache ─────────────────────────────────────────────────────
-    cache_key = make_cache_key(f"{last_date_str}_{module_type}", start_yr, fee_bps, int(epochs),
+    # Check model cache
+    cache_key = make_cache_key(cache_prefix, start_yr, fee_bps, int(epochs),
                                split_option, False, lookback)
     cached_data = load_cache(cache_key)
 
@@ -209,25 +201,25 @@ def run_module(module_type: str, df_raw: pd.DataFrame, start_yr: int, fee_bps: i
         trained_info = cached_data["trained_info"]
         test_dates = pd.DatetimeIndex(cached_data["test_dates"])
         test_slice = cached_data["test_slice"]
-        st.success("⚡ Results loaded from cache — no retraining needed.")
+        st.success("⚡ Model results loaded from cache")
     else:
         X_seq, y_seq = build_sequences(X_raw, y_raw, lookback)
         y_labels = returns_to_labels(y_seq)
 
         (X_train, y_train_r, X_val, y_val_r,
          X_test, y_test_r) = train_val_test_split(X_seq, y_seq, train_pct, val_pct)
-        (_, y_train_l, _, y_val_l,
-         _, _) = train_val_test_split(X_seq, y_labels, train_pct, val_pct)
+        (_, y_train_l, _, y_val_l, _, _) = train_val_test_split(
+            X_seq, y_labels, train_pct, val_pct
+        )
 
-        n_seq = len(X_seq)
         if len(X_train) == 0:
-            st.error(f"❌ Training set is empty. Try earlier Start Year.")
+            st.error("❌ Training set is empty. Try an earlier Start Year.")
             return False
         if len(X_val) == 0:
-            st.error(f"❌ Validation set is empty. Try earlier Start Year.")
+            st.error("❌ Validation set is empty. Try an earlier Start Year.")
             return False
         if len(X_test) == 0:
-            st.error(f"❌ Test set is empty. Try earlier Start Year.")
+            st.error("❌ Test set is empty. Try an earlier Start Year.")
             return False
 
         X_train_s, X_val_s, X_test_s, _ = scale_features(X_train, X_val, X_test)
@@ -239,10 +231,10 @@ def run_module(module_type: str, df_raw: pd.DataFrame, start_yr: int, fee_bps: i
         test_slice = slice(test_start, test_start + len(X_test))
 
         results, trained_info = {}, {}
-        progress = st.progress(0, text=f"Training {module_type.upper()} Approach 1...")
+        progress = st.progress(0, text="Training Approach 1...")
 
-        for approach, train_fn, predict_fn in [
-            ("Approach 1",
+        approach_configs = [
+            ("Approach 1", 
              lambda: train_approach1(X_train_s, y_train_l, X_val_s, y_val_l,
                                      n_classes=n_classes, epochs=int(epochs)),
              lambda m: predict_approach1(m[0], X_test_s)),
@@ -253,12 +245,14 @@ def run_module(module_type: str, df_raw: pd.DataFrame, start_yr: int, fee_bps: i
                                      val_size=val_size, n_classes=n_classes,
                                      epochs=int(epochs)),
              lambda m: predict_approach2(m[0], X_test_s, X_raw, m[3], m[2],
-                                         lookback, train_size, val_size)),
+                                          lookback, train_size, val_size)),
             ("Approach 3",
              lambda: train_approach3(X_train_s, y_train_l, X_val_s, y_val_l,
                                      n_classes=n_classes, epochs=int(epochs)),
              lambda m: predict_approach3(m[0], X_test_s)),
-        ]:
+        ]
+
+        for idx, (approach, train_fn, predict_fn) in enumerate(approach_configs):
             try:
                 model_out = train_fn()
                 preds, proba = predict_fn(model_out)
@@ -270,46 +264,52 @@ def run_module(module_type: str, df_raw: pd.DataFrame, start_yr: int, fee_bps: i
             except Exception as e:
                 st.warning(f"⚠️ {approach} failed: {e}")
                 results[approach] = None
+                trained_info[approach] = {"proba": None}
 
-            pct = {"Approach 1": 33, "Approach 2": 66, "Approach 3": 100}[approach]
-            progress.progress(pct, text=f"{approach} done...")
+            pct = int((idx + 1) / 3 * 100)
+            progress.progress(pct, text=f"{approach} complete...")
 
         progress.empty()
 
         save_cache(cache_key, {
-            "results": results, "trained_info": trained_info,
-            "test_dates": list(test_dates), "test_slice": test_slice,
+            "results": results,
+            "trained_info": trained_info,
+            "test_dates": list(test_dates),
+            "test_slice": test_slice,
         })
 
-    st.session_state.update({
-        results_key: results,
-        trained_info_key: trained_info,
-        test_dates_key: test_dates,
-        test_slice_key: test_slice,
-        optimal_lookback_key: optimal_lookback,
-        df_chart_key: df,
-        "tbill_rate": tbill_rate,
-        target_etfs_key: target_etfs,
-        output_ready_key: True,
-    })
+    # Store results
+    st.session_state[f"{prefix}_results"] = results
+    st.session_state[f"{prefix}_trained_info"] = trained_info
+    st.session_state[f"{prefix}_test_dates"] = test_dates
+    st.session_state[f"{prefix}_test_slice"] = test_slice
+    st.session_state[f"{prefix}_optimal_lookback"] = optimal_lookback
+    st.session_state[f"{prefix}_df_for_chart"] = df
+    st.session_state[f"{prefix}_target_etfs"] = target_etfs
+    st.session_state["tbill_rate"] = tbill_rate
+    st.session_state[f"{prefix}_output_ready"] = True
     
     return True
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DISPLAY FUNCTION: Show Module Results
+# DISPLAY FUNCTION
 # ═══════════════════════════════════════════════════════════════════════════════
 def display_module_results(module_type: str):
     """Display results for a specific module."""
-    prefix = "fi" if module_type == "fi" else "eq"
+    prefix = module_type
     
-    results = st.session_state[f"{prefix}_results"]
-    trained_info = st.session_state[f"{prefix}_trained_info"]
-    test_dates = st.session_state[f"{prefix}_test_dates"]
-    test_slice = st.session_state[f"{prefix}_test_slice"]
-    optimal_lookback = st.session_state[f"{prefix}_optimal_lookback"]
-    df = st.session_state[f"{prefix}_df_for_chart"]
-    tbill_rate = st.session_state["tbill_rate"]
-    target_etfs = st.session_state[f"{prefix}_target_etfs"]
+    results = st.session_state.get(f"{prefix}_results")
+    trained_info = st.session_state.get(f"{prefix}_trained_info")
+    test_dates = st.session_state.get(f"{prefix}_test_dates")
+    test_slice = st.session_state.get(f"{prefix}_test_slice")
+    optimal_lookback = st.session_state.get(f"{prefix}_optimal_lookback")
+    df = st.session_state.get(f"{prefix}_df_for_chart")
+    tbill_rate = st.session_state.get("tbill_rate")
+    target_etfs = st.session_state.get(f"{prefix}_target_etfs")
+
+    if not all([results, trained_info, test_dates is not None, df is not None]):
+        st.error("❌ Missing required data. Please run the analysis again.")
+        return
 
     winner_name = select_winner(results)
     winner_res = results.get(winner_name)
@@ -326,14 +326,15 @@ def display_module_results(module_type: str):
     show_signal_banner(winner_res["next_signal"], next_date, winner_name)
 
     winner_proba = trained_info[winner_name]["proba"]
-    conviction = compute_conviction(winner_proba[-1], target_etfs, include_cash=False)
-    show_conviction_panel(conviction)
+    if winner_proba is not None:
+        conviction = compute_conviction(winner_proba[-1], target_etfs, include_cash=False)
+        show_conviction_panel(conviction)
 
     st.divider()
 
     all_signals = {
         name: {"signal": res["next_signal"],
-               "proba": trained_info[name]["proba"][-1],
+               "proba": trained_info[name]["proba"][-1] if trained_info[name]["proba"] is not None else None,
                "is_winner": name == winner_name}
         for name, res in results.items() if res is not None
     }
@@ -343,7 +344,7 @@ def display_module_results(module_type: str):
     st.subheader(f"📊 {winner_name} — Performance Metrics")
 
     spy_ann = None
-    if "SPY_Ret" in df.columns:
+    if df is not None and "SPY_Ret" in df.columns and test_slice is not None:
         spy_raw = df["SPY_Ret"].iloc[test_slice].values.copy().astype(float)
         spy_raw = spy_raw[~np.isnan(spy_raw)]
         spy_raw = np.clip(spy_raw, -0.5, 0.5)
@@ -354,7 +355,7 @@ def display_module_results(module_type: str):
     show_metrics_row(winner_res, tbill_rate, spy_ann_return=spy_ann)
 
     st.divider()
-    st.subheader("🏆 Approach Comparison (Winner = Highest Raw Annualised Return)")
+    st.subheader("🏆 Approach Comparison")
     show_comparison_table(build_comparison_table(results, winner_name))
 
     st.divider()
@@ -362,134 +363,163 @@ def display_module_results(module_type: str):
     show_audit_trail(winner_res["audit_trail"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 1: FIXED INCOME (FI)
+# MULTI-YEAR SWEEP FUNCTION (per module)
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_fi:
-    st.header("🏛️ Fixed Income ETF Rotation")
-    st.markdown("**ETFs:** TLT, VNQ, SLV, GLD, LQD, HYG, VCIT")
+def show_module_multiyear(module_type: str, last_date_str: str, fee_bps: int, epochs: int,
+                          split_option: str, train_pct: float, val_pct: float, df_raw: pd.DataFrame):
+    """Display multi-year sweep section for a specific module."""
+    prefix = module_type
+    SWEEP_YEARS = [2010, 2012, 2014, 2016, 2018, 2019, 2021, 2023]
     
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        run_fi = st.button("🚀 Run FI Analysis", type="primary", use_container_width=True)
+    st.divider()
+    st.subheader("🔁 Multi-Year Consensus Sweep")
     
-    if run_fi:
-        with st.spinner("Running Fixed Income module..."):
-            success = run_module("fi", df_raw, start_yr, fee_bps, epochs, 
-                                train_pct, val_pct, last_date_str)
-        if success:
-            st.rerun()
-    
-    if st.session_state["fi_output_ready"]:
-        display_module_results("fi")
-    else:
-        st.info("👈 Click **🚀 Run FI Analysis** to start.")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2: EQUITY
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_equity:
-    st.header("📈 Equity ETF Rotation")
-    st.markdown("**ETFs:** QQQ, XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLU, XME, GDX, IWM")
-    
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        run_eq = st.button("🚀 Run Equity Analysis", type="primary", use_container_width=True)
-    
-    if run_eq:
-        with st.spinner("Running Equity module..."):
-            success = run_module("equity", df_raw, start_yr, fee_bps, epochs,
-                                train_pct, val_pct, last_date_str)
-        if success:
-            st.rerun()
-    
-    if st.session_state["eq_output_ready"]:
-        display_module_results("equity")
-    else:
-        st.info("👈 Click **🚀 Run Equity Analysis** to start.")
-
-# ── Multi-Year Sweep (Global) ─────────────────────────────────────────────────
-st.divider()
-st.subheader("🔁 Multi-Year Consensus Sweep")
-
-with st.expander("Run Multi-Year Analysis (Optional)"):
     st.markdown(
         "Runs **all 3 approaches** across **8 start years**, picks the winner per year, "
         "and aggregates signals into a weighted consensus vote."
     )
     
-    # Module selection for sweep
-    sweep_module = st.radio("Select Module for Sweep", ["Fixed Income", "Equity"], horizontal=True)
-    sweep_module_type = "fi" if sweep_module == "Fixed Income" else "equity"
-    
-    SWEEP_YEARS = [2010, 2012, 2014, 2016, 2018, 2019, 2021, 2023]
     st.caption(f"Sweep years: {', '.join(str(y) for y in SWEEP_YEARS)}")
     
-    # Action buttons
     col_info, col_run, col_force = st.columns([2, 1, 1])
     
     with col_info:
-        st.caption(f"Data date: {last_date_str} | Module: {sweep_module}")
+        st.caption(f"Data: {last_date_str}")
     
     with col_run:
         sweep_button = st.button(
-            "🚀 Run Consensus Sweep",
+            "🚀 Run Sweep",
             type="primary",
             use_container_width=True,
-            help="Runs sweep — uses cache where available, retrains stale years only.",
+            key=f"{prefix}_sweep_run"
         )
     
     with col_force:
         force_retrain_button = st.button(
-            "🔄 Force Retrain All",
+            "🔄 Force Retrain",
             type="secondary",
             use_container_width=True,
-            help="Clears all cached sweep results and retrains every year from scratch.",
+            key=f"{prefix}_sweep_force"
         )
     
-    # Handle Force Retrain
+    # Handle sweep execution
     if force_retrain_button:
-        st.session_state.multiyear_ready = False
-        st.session_state.multiyear_results = None
-        with st.spinner(f"🗑️ Sweep cache cleared — retraining all {sweep_module} years from scratch…"):
-            sweep_results = run_multiyear_sweep(
-                df_raw=df_raw,
-                sweep_years=SWEEP_YEARS,
-                fee_bps=fee_bps,
-                epochs=int(epochs),
-                split_option=split_option,
-                last_date_str=last_date_str,
-                train_pct=train_pct,
-                val_pct=val_pct,
-                force_retrain=True,
-                module_type=sweep_module_type,  # <-- Pass module_type
-            )
-        st.session_state.multiyear_results = sweep_results
-        st.session_state.multiyear_ready = True
+        st.session_state[f"{prefix}_multiyear_ready"] = False
+        st.session_state[f"{prefix}_multiyear_results"] = None
+        with st.spinner("Retraining all years..."):
+            try:
+                sweep_results = run_multiyear_sweep(
+                    df_raw=df_raw,
+                    sweep_years=SWEEP_YEARS,
+                    fee_bps=fee_bps,
+                    epochs=int(epochs),
+                    split_option=split_option,
+                    last_date_str=last_date_str,
+                    train_pct=train_pct,
+                    val_pct=val_pct,
+                    force_retrain=True,
+                    module_type=module_type,
+                )
+                st.session_state[f"{prefix}_multiyear_results"] = sweep_results
+                st.session_state[f"{prefix}_multiyear_ready"] = True
+                st.success("✅ Sweep complete!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Sweep failed: {e}")
     
-    # Handle normal Run
     elif sweep_button:
-        st.session_state.multiyear_ready = False
-        with st.spinner(f"Running {sweep_module} sweep..."):
-            sweep_results = run_multiyear_sweep(
-                df_raw=df_raw,
-                sweep_years=SWEEP_YEARS,
-                fee_bps=fee_bps,
-                epochs=int(epochs),
-                split_option=split_option,
-                last_date_str=last_date_str,
-                train_pct=train_pct,
-                val_pct=val_pct,
-                force_retrain=False,
-                module_type=sweep_module_type,  # <-- Pass module_type
-            )
-        st.session_state.multiyear_results = sweep_results
-        st.session_state.multiyear_ready = True
+        st.session_state[f"{prefix}_multiyear_ready"] = False
+        with st.spinner("Running sweep..."):
+            try:
+                sweep_results = run_multiyear_sweep(
+                    df_raw=df_raw,
+                    sweep_years=SWEEP_YEARS,
+                    fee_bps=fee_bps,
+                    epochs=int(epochs),
+                    split_option=split_option,
+                    last_date_str=last_date_str,
+                    train_pct=train_pct,
+                    val_pct=val_pct,
+                    force_retrain=False,
+                    module_type=module_type,
+                )
+                st.session_state[f"{prefix}_multiyear_results"] = sweep_results
+                st.session_state[f"{prefix}_multiyear_ready"] = True
+                st.success("✅ Sweep complete!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ Sweep failed: {e}")
     
-    # Display results
-    if st.session_state.multiyear_ready and st.session_state.multiyear_results:
+    # Display sweep results
+    if st.session_state.get(f"{prefix}_multiyear_ready") and st.session_state.get(f"{prefix}_multiyear_results"):
         show_multiyear_results(
-            st.session_state.multiyear_results,
+            st.session_state[f"{prefix}_multiyear_results"],
             sweep_years=SWEEP_YEARS,
         )
-    elif not st.session_state.multiyear_ready:
-        st.info(f"Click **🚀 Run Consensus Sweep** to analyse all {sweep_module} start years at once.")
+    elif not st.session_state.get(f"{prefix}_multiyear_ready"):
+        st.info("Click **🚀 Run Sweep** to analyse all start years.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN TABS
+# ═══════════════════════════════════════════════════════════════════════════════
+tab_fi, tab_equity = st.tabs(["🏛️ Fixed Income (FI)", "📈 Equity"])
+
+# ── TAB 1: FIXED INCOME ────────────────────────────────────────────────────────
+with tab_fi:
+    st.header("🏛️ Fixed Income ETF Rotation")
+    st.markdown("**ETFs:** TLT, VNQ, SLV, GLD, LQD, HYG, VCIT")
+    
+    run_fi = st.button(
+        "🚀 Run FI Analysis", 
+        type="primary", 
+        use_container_width=True,
+        key="fi_run_button"
+    )
+    
+    if run_fi:
+        with st.spinner("Running Fixed Income module..."):
+            success = run_module(
+                "fi", df_raw, start_yr, fee_bps, epochs, 
+                train_pct, val_pct, last_date_str
+            )
+        if success:
+            st.rerun()
+    
+    if st.session_state.get("fi_output_ready"):
+        display_module_results("fi")
+        
+        # Multi-year sweep INSIDE the FI tab
+        show_module_multiyear("fi", last_date_str, fee_bps, epochs,
+                             split_option, train_pct, val_pct, df_raw)
+    else:
+        st.info("👈 Click **🚀 Run FI Analysis** to start.")
+
+# ── TAB 2: EQUITY ──────────────────────────────────────────────────────────────
+with tab_equity:
+    st.header("📈 Equity ETF Rotation")
+    st.markdown("**ETFs:** QQQ, XLK, XLF, XLE, XLV, XLI, XLY, XLP, XLU, XME, GDX, IWM")
+    
+    run_eq = st.button(
+        "🚀 Run Equity Analysis", 
+        type="primary", 
+        use_container_width=True,
+        key="eq_run_button"
+    )
+    
+    if run_eq:
+        with st.spinner("Running Equity module..."):
+            success = run_module(
+                "eq", df_raw, start_yr, fee_bps, epochs,
+                train_pct, val_pct, last_date_str
+            )
+        if success:
+            st.rerun()
+    
+    if st.session_state.get("eq_output_ready"):
+        display_module_results("eq")
+        
+        # Multi-year sweep INSIDE the Equity tab
+        show_module_multiyear("eq", last_date_str, fee_bps, epochs,
+                             split_option, train_pct, val_pct, df_raw)
+    else:
+        st.info("👈 Click **🚀 Run Equity Analysis** to start.")
