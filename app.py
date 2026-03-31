@@ -424,6 +424,72 @@ with st.expander("Run Multi-Year Analysis (Optional)"):
     SWEEP_YEARS = [2010, 2012, 2014, 2016, 2018, 2019, 2021, 2023]
     st.caption(f"Sweep years: {', '.join(str(y) for y in SWEEP_YEARS)}")
     
-    # Note: You would need to modify ui/multiyear.py to accept module_type parameter
-    # For now, this is a placeholder showing the UI structure
-    st.info("Multi-year sweep implementation requires updating ui/multiyear.py to support module_type parameter.")
+    # Action buttons
+    col_info, col_run, col_force = st.columns([2, 1, 1])
+    
+    with col_info:
+        st.caption(f"Data date: {last_date_str} | Module: {sweep_module}")
+    
+    with col_run:
+        sweep_button = st.button(
+            "🚀 Run Consensus Sweep",
+            type="primary",
+            use_container_width=True,
+            help="Runs sweep — uses cache where available, retrains stale years only.",
+        )
+    
+    with col_force:
+        force_retrain_button = st.button(
+            "🔄 Force Retrain All",
+            type="secondary",
+            use_container_width=True,
+            help="Clears all cached sweep results and retrains every year from scratch.",
+        )
+    
+    # Handle Force Retrain
+    if force_retrain_button:
+        st.session_state.multiyear_ready = False
+        st.session_state.multiyear_results = None
+        with st.spinner(f"🗑️ Sweep cache cleared — retraining all {sweep_module} years from scratch…"):
+            sweep_results = run_multiyear_sweep(
+                df_raw=df_raw,
+                sweep_years=SWEEP_YEARS,
+                fee_bps=fee_bps,
+                epochs=int(epochs),
+                split_option=split_option,
+                last_date_str=last_date_str,
+                train_pct=train_pct,
+                val_pct=val_pct,
+                force_retrain=True,
+                module_type=sweep_module_type,  # <-- Pass module_type
+            )
+        st.session_state.multiyear_results = sweep_results
+        st.session_state.multiyear_ready = True
+    
+    # Handle normal Run
+    elif sweep_button:
+        st.session_state.multiyear_ready = False
+        with st.spinner(f"Running {sweep_module} sweep..."):
+            sweep_results = run_multiyear_sweep(
+                df_raw=df_raw,
+                sweep_years=SWEEP_YEARS,
+                fee_bps=fee_bps,
+                epochs=int(epochs),
+                split_option=split_option,
+                last_date_str=last_date_str,
+                train_pct=train_pct,
+                val_pct=val_pct,
+                force_retrain=False,
+                module_type=sweep_module_type,  # <-- Pass module_type
+            )
+        st.session_state.multiyear_results = sweep_results
+        st.session_state.multiyear_ready = True
+    
+    # Display results
+    if st.session_state.multiyear_ready and st.session_state.multiyear_results:
+        show_multiyear_results(
+            st.session_state.multiyear_results,
+            sweep_years=SWEEP_YEARS,
+        )
+    elif not st.session_state.multiyear_ready:
+        st.info(f"Click **🚀 Run Consensus Sweep** to analyse all {sweep_module} start years at once.")
