@@ -21,7 +21,7 @@ import numpy as np
 import plotly.graph_objects as go
 from collections import Counter, defaultdict
 
-from data.loader             import get_features_and_targets
+from data.loader             import get_features_and_targets, FI_ETF_COLS, EQUITY_ETF_COLS
 from models.base             import (build_sequences, train_val_test_split,
                                      scale_features, returns_to_labels,
                                      find_best_lookback, make_cache_key,
@@ -34,6 +34,7 @@ from signals.conviction          import compute_conviction
 
 # ── ETF display colours ───────────────────────────────────────────────────────
 ETF_COLOURS = {
+    # FI ETFs
     "TLT":  "#4fc3f7",
     "VNQ":  "#aed581",
     "SLV":  "#b0bec5",
@@ -41,6 +42,19 @@ ETF_COLOURS = {
     "LQD":  "#7986cb",
     "HYG":  "#ff8a65",
     "VCIT": "#a1887f",
+    # Equity ETFs
+    "QQQ":  "#ff6b6b",
+    "XLK":  "#4ecdc4",
+    "XLF":  "#45b7d1",
+    "XLE":  "#96ceb4",
+    "XLV":  "#ffeaa7",
+    "XLI":  "#dfe6e9",
+    "XLY":  "#fd79a8",
+    "XLP":  "#a29bfe",
+    "XLU":  "#74b9ff",
+    "XME":  "#636e72",
+    "GDX":  "#b8a88f",
+    "IWM":  "#e17055",
     "CASH": "#78909c",
 }
 DEFAULT_COLOUR = "#90caf9"
@@ -62,6 +76,7 @@ def run_multiyear_sweep(
     train_pct:     float,
     val_pct:       float,
     force_retrain: bool = False,
+    module_type:   str = "fi",  # <-- NEW PARAMETER
 ) -> list:
     """
     For each year in sweep_years, run ALL 3 approaches exactly as app.py does,
@@ -75,6 +90,8 @@ def run_multiyear_sweep(
     force_retrain : bool
         When True, ignores all cache and retrains every year from scratch.
         Fresh results are saved to cache so subsequent normal runs are fast.
+    module_type : str
+        "fi" or "equity" — determines which ETF universe to use.
 
     Returns
     -------
@@ -96,7 +113,7 @@ def run_multiyear_sweep(
         progress_bar.progress(pct, text=f"Processing start year {yr}…")
         status_area.info(
             f"{'🔄 Retraining' if force_retrain else '🔍 Checking cache for'} "
-            f"year {yr} ({idx+1}/{len(sweep_years)})"
+            f"year {yr} ({idx+1}/{len(sweep_years)}) [{module_type.upper()}]"
         )
 
         row = {
@@ -122,7 +139,8 @@ def run_multiyear_sweep(
                 sweep_results.append(row)
                 continue
 
-            input_features, target_etfs, tbill_rate, df, _ = get_features_and_targets(df)
+            # Pass module_type to get_features_and_targets
+            input_features, target_etfs, tbill_rate, df, _ = get_features_and_targets(df, module_type=module_type)
             n_etfs    = len(target_etfs)
             n_classes = n_etfs
 
@@ -139,8 +157,8 @@ def run_multiyear_sweep(
                 if mask.any():
                     y_raw[mask, j] = 0.0
 
-            # ── Lookback — same cache key as app.py (no sweep prefix) ─────────
-            lb_key    = make_cache_key(last_date_str, yr, fee_bps, epochs,
+            # ── Lookback — same cache key as app.py (includes module_type) ─────────
+            lb_key    = make_cache_key(f"{last_date_str}_{module_type}", yr, fee_bps, epochs,
                                        split_option, False, 0)
             lb_cached = None if force_retrain else load_cache(f"lb_{lb_key}")
 
@@ -156,10 +174,8 @@ def run_multiyear_sweep(
             lookback       = optimal_lookback
             row["lookback"] = lookback
 
-            # ── Model cache — IDENTICAL key to app.py ────────────────────────
-            # This is the critical change: no "sweep2_" prefix.
-            # If app.py already ran and cached year `yr`, we load it here for free.
-            cache_key   = make_cache_key(last_date_str, yr, fee_bps, int(epochs),
+            # ── Model cache — IDENTICAL key to app.py (includes module_type) ────────────────────────
+            cache_key   = make_cache_key(f"{last_date_str}_{module_type}", yr, fee_bps, int(epochs),
                                          split_option, False, lookback)
             cached_data = None if force_retrain else load_cache(cache_key)
 
