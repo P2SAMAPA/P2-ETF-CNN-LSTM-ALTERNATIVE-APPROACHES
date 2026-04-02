@@ -374,12 +374,14 @@ def display_multiyear_sweep(module_type: str, last_date_str: str, fee_bps: int, 
                             split_option: str, train_pct: float, val_pct: float, df_raw: pd.DataFrame):
     """Display multi-year sweep section for a specific module."""
     prefix = module_type
-    SWEEP_YEARS = [2010, 2012, 2014, 2016, 2018, 2019, 2021, 2023]
+    # --- CHANGE: Now runs all years from 2008 to 2025 ---
+    SWEEP_YEARS = list(range(2008, 2026))   # 2008..2025 inclusive
+    # ---------------------------------------------------
     
     st.subheader("🔁 Multi-Year Consensus Sweep")
     
     st.markdown(
-        "Runs **all 3 approaches** across **8 start years**, picks the winner per year, "
+        "Runs **all 3 approaches** across **all years from 2008 to 2025**, picks the winner per year, "
         "and aggregates signals into a weighted consensus vote. "
         "Each year uses the same fee, epochs, and split settings as the sidebar."
     )
